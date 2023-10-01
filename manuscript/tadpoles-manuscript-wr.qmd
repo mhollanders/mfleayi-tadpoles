@@ -1,0 +1,419 @@
+---
+title: "High chytrid prevalence and infection intensities in tadpoles of *Mixophyes fleayi*"
+author: "Matthijs Hollanders, Laura F. Grogan, Hamish I. McCallum, David A. Newell"
+format:
+  pdf:
+    toc: false
+    number-sections: true
+    number-depth: 1
+    toc-depth: 3
+    lof: false
+    lot: false
+    toc-title: Contents
+execute:
+  echo: false
+  warning: false
+bibliography: refs.json
+csl: wildlife-research.csl
+geometry: margin = 1in
+linestretch: 1.5
+header-includes: |
+  \usepackage{titling}
+  \pretitle{\begin{flushleft}\Large\bfseries}
+  \posttitle{\end{flushleft}}  
+  \preauthor{\begin{flushleft}\large}
+  \postauthor{\end{flushleft}} 
+  \usepackage{lineno}
+  \linenumbers
+  \raggedright
+  \usepackage{float}
+  \floatplacement{figure}{H}
+  \usepackage[bf]{caption}
+  \renewcommand{\thesection}{\Roman{section}}
+  \renewcommand{\abstractname}{Short summary}
+  \newcommand{\beginsupplement}{
+    \setcounter{table}{0} 
+    \renewcommand{\thetable}{S\arabic{table}}
+    \setcounter{figure}{0} 
+    \renewcommand{\thefigure}{S\arabic{figure}}}
+#  \modulolinenumbers[5]
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+# options and packages
+options(scipen = 999, digits = 3)
+if (!require(pacman)) install.packages("pacman")
+pacman::p_load(dplyr, readr, janitor, HDInterval, nimble)
+
+# read model fit object
+m2_fit <- read_rds("../mcmc/m2-fit.rds")
+
+# extract samples and convert to tibble with clean names
+m2 <- do.call(rbind, m2_fit$samples) |> as_tibble() |> clean_names()
+m2_2 <- do.call(rbind, m2_fit$samples2) |> as_tibble() |> clean_names()
+
+# number of latent infections
+z <- m2_2 |>
+  select(starts_with("z")) |>
+  colMeans() |>
+  sum() |>
+  round()
+```
+
+# Short summary
+
+The amphibian chytrid fungus has descimated frog populations but infection outcome depends on the frog's life stage. We investigated chytrid infection patterns in tadpoles and found that they are often infected with higher pathogen loads than adults and juveniles. This suggests that tadpoles could act as a reservoir for infection and further opens the door to additional research into immune responses of different amphibian life stages. Photo by Matthijs Hollanders.
+  
+![](../figs/fig-mouths.jpg){width="62%"}
+
+\newpage
+
+# Abstract
+
+**Context:** The amphibian chytrid fungus *Batrachochytrium dendrobatidis* (*Bd*) has caused catastrophic biodiversity loss globally, but species and life-stages within species respond differently to the pathogen. Although tadpoles are often reported to be less vulnerable to disease, they can constitute important infection reservoirs in ecosystems.
+
+**Aims:** We aimed to describe *Bd* infection patterns of a long-lived tadpole in a species where post-metamorphic animals appear to exhibit limited mortality due to chytridiomycosis. We further investigated how oral dekeratinisation can be used as an indicator for infection.
+
+**Methods:** We conducted surveys over two years for tadpoles of *Mixophyes fleayi* (Fleay's barred frog) at two rainforest streams on the east coast of Australia to assess patterns in *Bd* infection prevalence and intensity. We developed an integrated hierarchical model propagating pathogen detection errors and incorporated how *Bd* infections affect oral dekeratinisation.
+
+**Key results:** We found that *Bd* infection prevalence was strongly associated with lower temperatures and larger body size, consistent with *Bd* optimal thermal range and a cumulative risk of exposure for tadpoles. The individual probability of a tadpole being infected with *Bd* was estimated to be `r median(expit(m2$logit_psi_alpha))` \[95% HPDI: `r hdi(expit(m2$logit_psi_alpha))`\], approximately `r round((median(expit(m2$logit_psi_alpha) / (1 - expit(m2$logit_psi_alpha)))) / (0.15 / (1 - 0.15)), 0)` times greater than for adults at the same sites. Tadpoles infected with *Bd* were `r round(median(exp(m2$lambda_beta_1)), 0)` \[`r round(hdi(exp(m2$lambda_beta_1)), 0)`\] times more likely have oral dekeratinisation than uninfected tadpoles, where uninfected individuals were estimated to have a `r median(expit(m2$logit_lambda_alpha))` \[95% HPDI: `r hdi(expit(m2$logit_lambda_alpha))`\] probability of having mouthpart loss.
+
+**Conclusions:** Our results show that *M. fleayi* tadpoles are more likely to be infected with *Bd* than adults, suggesting that tadpoles could contribute to *Bd* maintenance in streams. We further show that sites can be rapidly assessed for *Bd* by visually checking for oral dekeratinisation.
+
+**Implications:** Long-lived tadpoles in general may contribute to *Bd* maintenance in ecosystems. We suggest continued exploration of *Bd* immunocompetence across amphibian life stages to further understand the vastly different infection patterns.
+
+**Keywords:** *Batrachochytrium dendrobatidis*, tadpole, amphibian, chytridiomycosis, dekeratinisation, pathogen load, mouthpart loss, pathogen detection
+
+\newpage
+
+# Introduction
+
+The global invasion of the pathogenic amphibian chytrid fungus (*Batrachochytrium dendrobatidis*, *Bd*) has strongly impacted frog species around the world [@berger1998; @scheele2019a]. However, where some species have been decimated or even driven extinct, others appear to incur fewer costs due to the fungus. Moreover, different life stages present heterogeneity in vulnerability to mortality: where post-metamorphic stages are frequently cited as being more vulnerable---particularly around metamorphosis itself---larval stages (hereafter interchangeably used with tadpoles) experience fewer detrimental effects [@garner2009; @ortiz-santaliestra2013; @sauer2020].
+
+Although *Bd* infections only rarely directly lead to mortality in tadpoles [@blaustein2005; @arellano2017], infections likely still impact them negatively by limiting feeding ability [@cashins2009; @venesky2009; @hagman2015; @harjoe2022], possibly reducing growth and size at metamorphosis [@garner2009], which may impact individuals post-metamorphosis [@altwegg2003 ; @garner2009; @kilpatrick2010; @sauer2020]. Given the immune system reorganisation that takes place at metamorphosis [@rollins-smith1998], highly infected tadpoles may experience considerable costs around this stage and larval *Bd* infections may further reduce fitness of recently metamorphosed individuals [@garner2009; @briggs2010; @fernandez-loras2017; @sauer2020]. Because the fungus only infects keratinised body parts, which in tadpoles only occur in mouthparts, dekeratinisation of oral structures (hereafter interchangeably used with mouthpart loss) caused by *Bd* may be the mechanism that negatively impacts larval feeding ability [@marantelli2004; @cashins2009; @venesky2009; @harjoe2022]. For example, torrent-adapted tadpoles in tropical streams were reported to have decreased body condition with increased oral dekeratinisation, with body condition improving upon the regrowth of oral structures [@cashins2009]. Upon metamorphosis, the distribution of keratin shifts from the mouthparts to the skin, which rapidly becomes infected with *Bd* upon development [@marantelli2004; @mcmahon2015]. Dekeratinisation of the oral structures, in particular when it is observed in the jaw sheaths, has frequently been noted as an indicator for *Bd* infection in tadpoles [@fellers2001; @rachowicz2002; @marantelli2004; @blaustein2005; @knapp2006; @drake2007; @cashins2009]. However, the extent to which dekeratinisation is a good indicator appears to be species-specific [@navarro-lozano2018].
+
+In addition to the costs accrued during the larval phase, tadpoles may act as a reservoir for *Bd* in ecosystems when they occur in permanent water bodies, particularly when tadpoles are long-lived [@rachowicz2004; @briggs2010; @catenazzi2013; @valencia-aguilar2016; @courtois2017; @sapsford2018; @dasneves-da-silva2021]. Reservoirs---hosts that permanently maintain the pathogen and transmit it to other hosts [@haydon2002]---can greatly influence disease impact by increasing the exposure to susceptible individuals [@gog2002; @decastro2004]. When terrestrial habitats seasonally warm up and dry out, becoming unfavourable for *Bd* growth [@piotrowski2004], the prevalence and intensity (measured as pathogen load) of *Bd* infections frequently decreases in adult frogs [@kriger2007]. However, aquatic environments may maintain lower temperatures and the requisite moisture requirements for *Bd* growth, facilitating the maintenance of *Bd* in ecosystems [@sapsford2018]. Tadpoles may therefore remain infected with (and exposed to) *Bd* under conditions that are favourable to the fungus for long periods of time, and have higher infection prevalence than post-metamorphic individuals.
+
+Previous research has found associations between *Bd* infections, tadpole body size, and temperature [@cashins2009; @catenazzi2013; @valencia-aguilar2016; @sapsford2018]. Larger tadpoles are reportedly more likely to be infected with *Bd*, likely due to the cumulative exposure older tadpoles have accrued to *Bd* zoospores in the water over time [@valencia-aguilar2016; @sapsford2018]. Infections with *Bd* tend to be more common, and infection intensities higher, with lower water temperatures, likely due to the thermal preferences of *Bd* [@sapsford2018]. Although both temperature and body size appear to be influential variables, ambiguity remains about the relative contributions of each on both infection prevalence and intensity in tadpoles [@sapsford2018; @dasneves-da-silva2021].
+
+In this study, we assessed the seasonal *Bd* infection prevalence and infection intensity (pathogen load) of tadpoles over two years in two independent streams. We focused on tadpoles of *Mixophyes fleayi* (Fleay's barred frog), an endangered rainforest species for which the *Bd* prevalence, intensity, and impacts on mortality have been intensively assessed in both adult and recently metamorphosed populations [@hollanders2023; @hollanders2023a]. We built a modified version of a recently developed Bayesian hierarchical model to estimate the effect of temperature, body size, and their interaction on *Bd* infections. We also assessed to what extent mouthpart loss can be predicted by *Bd* infection and the uncertainty associated with using mouthpart loss as a proxy for *Bd* infection. Our results provide valuable insight into *Bd* dynamics of a long-lived tadpole in subtropical stream environments.
+
+\newpage
+
+# Methods
+
+## Field surveys
+
+We conducted tadpole surveys at six-weekly intervals from September 2019--January 2021 at Brindle Creek, Border Ranges National Park and Tuntable Creek, Nightcap National Park, New South Wales, Australia. At Brindle Creek, we sampled from two adjacent pools separated by a riffle section where adult frogs were known to breed. At Tuntable Creek, we sampled from four pools separated by riffle sections. We used a dipnet (Jonah's Aquarium The Perfect Dipnet, 1/8" mesh) to sample each pool for 1 min.
+
+Tadpoles were held in a plastic tub and up to 40 individuals were processed (photographed and sampled for *Bd*) per site per occasion. For one year at Brindle Creek we took a top-down photograph of the full tub of tadpoles (prior to subsampling 40 for processing) in order to measure the length of each tadpole (from the tip of the nose to the base of the tail) using the Ruler Tool in Adobe Photoshop to gauge the distribution of size classes (@fig-lengths-brindle). We handled tadpoles following @cashins2009, photographed their mouthparts (Nikon D750 and Sigma 105mm macro at minimum focus), and sampled for *Bd* using swabs (five horizontal strokes and five vertical strokes across the mouthparts). For 620 individuals sampled over the two years, we photographed mouthparts to identify mouthpart loss associated with *Bd* and to derive a body size proxy, for which we used the distance between the two mouth corners measured in pixels using the Ruler Tool in Adobe Photoshop 2020. We chose to measure body size indirectly using this method to reduce handling time of the animals and to get a more precise measurement compared to measuring body length in-hand using calipers. We verified the method by comparing body length measurements using calipers with mouthpart widths measured using Photoshop of 136 individuals and found strong agreement between the two measurements (@fig-lengths). We identified mouthpart loss by assessing for dekeratinisation of the jaw sheaths from photographs, and scored the amount of dekeratinisation of both the bottom and top jaw sheath on a scale of 1--5 (@fig-mouths).
+
+We placed dataloggers (HOBO MX2201) along the edge of the stream to record temperature every 2 hrs for the duration of the study. We relied on terrestrial dataloggers for our analysis because dataloggers in the creeks were swept away by floods.
+
+**\< @fig-mouths could go here.\>**
+
+## Laboratory work
+
+We extracted and amplified *Bd* DNA using standard protocols [@boyle2004; @hyatt2007; @brannelly2020]. Briefly, DNA was extracted using Prepman^®^ Ultra (Applied Biosystems) without bead-beating step [@brannelly2020]. Then, sample DNA was amplified using quantitative Polymerase Chain Reaction (qPCR) in duplicate with synthetic gBlocks ITS reference standards (Integrated DNA Technologies) to quantify *Bd* DNA present on swabs. We considered samples positive when at least one qPCR well returned *Bd* DNA. Infection intensities are reported as log~10~ gene copies per swab. For further details on the laboratory process, see @hollanders2023.
+
+## Statistical analysis
+
+To identify patterns in *Bd* infection status (infected/uninfected) and infection intensity (pathogen load), we fit a model to swab infection status and (log~10~) swab infection intensities, respectively, correcting for measurement error in the qPCR and the sampling processes [@direnzo2018, Appendix S2]. The model incorporated imperfect pathogen detection in the qPCR process through both false-negatives and false-positives, and further introduced measurement error in the swab infection intensities using an informative prior, because infection intensities measured from single samples may not accurately reflect the true infection intensities of individuals [@direnzo2018; @mcelreath2020b; @hollanders2022]. Note that although infection status was corrected for imperfect detection due to qPCR, we did not model the false-negatives associated with the swabbing protocol; however, double-swabbing tadpoles would likely not have yielded independent samples [@hollanders2022].
+
+The model featured a logistic regression component to latent infection status and a linear regression to latent individual infection intensities (see Appendix S2 for details). Both regression models included site, average temperature over the six-week survey intervals, (log) tadpole size (using the proxy of mouthpart width), all pairwise interactions, the three-way interaction, and correlated random survey effects as predictors. We modeled both the presence (binary) and intensity (ordinal) of mouthpart loss, as determined by the presence and degree of dekeratinization of the jaw sheath (summed over both top and bottom), as descendant variables of *Bd* infection. Each component was modeled as a function (logit-linear for status and ordered probit for intensity) of latent estimated *Bd* infection intensity (and infection status for presence only) and correlated random survey effects. Additionally, we included effects of body size separately for infected and uninfected tadpoles. We conducted posterior predictive checks for the four components of the model and calculated Bayesian *p*-values for each to assess goodness-of-fit [@gelman1996, Appendix S2].
+
+We implemented the model with Bayesian methods using NIMBLE 1.0.1 [@devalpine2017; @devalpine2023] through R 4.3.0 [@rcoreteam2023] with weakly informative priors (except for the measurement error of the swabbing process, @tbl-m2, Appendix S2). For predictor variable selection, we used NIMBLE's built-in reversible jump MCMC [RJMCMC, @green1995] samplers, which excludes parameters that do not contribute sufficiently to the likelihood (and toggles values to 0 for those iterations where parameters are excluded). Predictors were centered and scaled by two standard deviations to allow direct comparison between binary (site) and continuous (temperature and body size) effects [@gelman2008a]. We imputed missing body size values (*n* = 244) from a normal distribution parameterized from observed values (*n* = 621) using MCMC. We ran 4 chains for 50,000 iterations after discarding 10,000 as burn-in and thinning chains by 10, yielding 20,000 posterior samples which resulted in convergence of all model parameters. We summarized posterior distributions with medians and 95% highest posterior density intervals (HPDIs), included the samples where RJMCMC toggled coefficients to 0 in these summary statistics, report the RJMCMC inclusion probabilities, and considered effects important when 95% HPDIs of the coefficients did not overlap 0. The analysis is fully reproducible on [https://github.com/mhollanders/mfleayi-tadpoles](https://github.com/mhollanders/mfleayi-tadpoles).
+
+\newpage
+
+**\< @fig-lengths-brindle could go here.\>**
+
+# Results
+
+## Sampling summary
+
+We captured and swabbed 865 *M. fleayi* tadpoles (424 at Brindle and 441 at Tuntable) over 25 surveys. Of those, 54% (471) returned *Bd* DNA in at least one qPCR run, with the median *Bd* infection intensity being 4.02 log~10~ gene copies per swab (averaged over duplicate qPCR runs). Of the 620 tadpoles sampled for mouthpart loss, 39% (243) showed dekeratinisation: of those, 95% (230) returned *Bd* in at least one qPCR replicate. Because tadpoles were not marked, some individuals may have been sampled more than once over the study period. Tadpoles were present year-round, with pulses of reproduction occurring in Austral spring and autumn (@fig-lengths-brindle).
+
+## *Bd* infection prevalence
+
+Average *Bd* prevalence was estimated as `r median(expit(m2$logit_psi_alpha))` \[95% HPDI: `r hdi(expit(m2$logit_psi_alpha))`\], with no significant site effect (log odds change `r median(m2$psi_beta_3)` \[95% HPDI: `r hdi(m2$psi_beta_3)`\], RJMCMC inclusion `r mean(m2$psi_w_3)`) (@tbl-m2). Individual probability of being infected with *Bd* was strongly negatively associated with temperature (log odds change `r median(m2$psi_beta_1)` \[95% HPDI: `r hdi(m2$psi_beta_1)`\], RJMCMC inclusion `r mean(m2$psi_w_1)`) and strongly positively with body size (log odds change `r median(m2$psi_beta_2)` \[95% HPDI: `r hdi(m2$psi_beta_2)`\], RJMCMC inclusion `r mean(m2$psi_w_2)`) (@tbl-m2, @fig-psi). We found weak evidence for interaction effects, with low RJMCMC inclusion probabilities and effect estimates overlapping 0 (@tbl-m2). The Bayesian *p*-value of the prevalence component of the model was `r mean(m2$y_bpv)`, indicating reasonable fit (Appendix S2, [@fig-ppc]a). Model fit improved significantly with the addition of the random survey effect (comparison not shown), which was large (standard deviation \[SD\] of the effect `r median(m2$sigma_t_1_1)` \[95% HPDI: `r hdi(m2$sigma_t_1_1)`\]), suggesting a considerable amount of unexplained variation between surveys ([@fig-surv]a). The survey effects were somewhat positively correlated with those of infection intensity (correlation of `r median(m2$cor_t_1)` \[95% HPDI: `r hdi(m2$cor_t_1)`\]), suggesting that when infection were common the associated infection intensities were also relatively high. The probability of detecting *Bd* using qPCR was high (probability of detecting one log~10~ gene copy in a qPCR replicate estimated as `r median(m2$r)` \[95% HPDI: `r hdi(m2$r)`\], yielding a `r options(digits = 3) ; median(1 - (1 - (1 - (1 - m2$r) ^ median(m2$mu_alpha))) ^ 2)` \[95% HPDI: `r hdi(1 - (1 - (1 - (1 - m2$r) ^ median(m2$mu_alpha))) ^ 2)`\] probability of detecting the average load after two qPCR replicates), reflected in that the model estimated that `r z` individuals were infected compared to the 471 infections that we observed. The false-positive probability of detecting *Bd* in the qPCR protocol was estimated low (`r median(m2$delta21)` \[95% HPDI: `r hdi(m2$delta21)`\]), but note that *Bd* detection errors in the swabbing process was not modeled because only single swabs were collected. `r options(digits = 2)`
+
+**\< @fig-psi could go here.\>**
+
+## *Bd* infection intensity `r options(digits = 2)`
+
+Average *Bd* infection intensity was estimated as `r median(m2$mu_alpha)` \[95% HPDI: `r hdi(m2$mu_alpha)`\] log~10~ gene copies, with no significant differences between sites (RJMCMC inclusion `r mean(m2$mu_w_3)`), with a population SD of `r median(exp(m2$mu_sigma_1))` \[95% HPDI: `r hdi(exp(m2$mu_sigma_1))`\] (@tbl-m2). There was a weak positive association between individual *Bd* infection intensity and body size (log change `r median(m2$mu_beta_2)` \[`r hdi(m2$mu_beta_2)`\], RJMCMC inclusion `r mean(m2$mu_w_2)`) (@fig-mu) but no association with temperature (log change `r median(m2$mu_beta_1)` \[95% HPDI: `r hdi(m2$mu_beta_1)`\], RJMCMC inclusion `r mean(m2$mu_w_1)`). We found no evidence for interaction effects, and unexplained variation in the form of survey effects was small (SD of survey effect `r median(m2$sigma_t_1_2)` \[95% HPDI: `r hdi(m2$sigma_t_1_2)`\]) (@tbl-m2, [@fig-surv]b). There was some measurement error associated with the qPCR process (SD of effect `r median(m2$mu_sigma_3)` \[95% HPDI: `r hdi(m2$mu_sigma_3)`\]), and together with the additional swabbing measurement error (`r median(m2$mu_sigma_2)` \[95% HPDI: `r hdi(m2$mu_sigma_2)`\]) incorporated into the model with an informative prior, there were considerable differences between the observed swab infection intensities (computed as the sample mean of positive qPCR replicates) and the estimated latent individual infection intensities (@fig-mu). The Bayesian *p*-value for this model was `r mean(m2$x_bpv)`, suggesting decent fit (Appendix S2, [@fig-ppc]b).
+
+## Mouthpart loss
+
+The presence of mouthpart loss, specifically determined by dekeratinisation of the jaw sheath, was strongly influenced by *Bd* infection. Uninfected individuals had a probability of `r median(expit(m2$logit_lambda_alpha))` \[95% HPDI: `r hdi(expit(m2$logit_lambda_alpha))`\] of having mouthpart loss, where infected tadpoles (carrying the average *Bd* infection intensity) had a `r median(expit(logit(expit(m2$logit_lambda_alpha)) + m2$lambda_beta_1))` \[95% HPDI: `r hdi(expit(logit(expit(m2$logit_lambda_alpha)) + m2$lambda_beta_1))`\] probability (log odds change `r median(m2$lambda_beta_1)` \[95% HPDI: `r hdi(m2$lambda_beta_1)`\], RJMCMC inclusion `r mean(m2$lambda_w_1)`) (@tbl-m2, [@fig-kaplam]a). This implies that individuals infected with *Bd* had `r round(median(exp(m2$lambda_beta_1)), 0)` \[95% HPDI: `r round(hdi(exp(m2$lambda_beta_1)), 0)`\] times greater odds to have dekeratinisation of the jaw sheath than uninfected individuals, and that there was a `r median(1 - expit(logit(expit(m2$logit_lambda_alpha)) + m2$lambda_beta_1))` \[95% HPDI: `r hdi(1 - expit(logit(expit(m2$logit_lambda_alpha)) + m2$lambda_beta_1))`\] probability of tadpoles infected with *Bd* to not have dekeratinisation. For those individuals that were infected with *Bd*, higher *Bd* infection intensities were associated with a considerably higher probability of mouthpart loss (log odds change `r median(m2$lambda_beta_2)` \[95% HPDI: `r hdi(m2$lambda_beta_2)`\], RJMCMC inclusion `r mean(m2$lambda_w_2)`) ([@fig-kaplam]b). Body size was not found to have a direct effect on the probability of mouthpart loss. There was a large amount of unexplained survey variation (SD of survey effect `r median(m2$sigma_t_2_1)` \[`r hdi(m2$sigma_t_2_1)`\]), which was strongly correlated with those of mouthpart loss intensity (`r median(m2$cor_t_2)` \[95% HPDI: `r hdi(m2$cor_t_2)`\]), showing that when many tadpoles had some degree of mouthpart loss that the intensity of mouthpart loss was high ([@fig-surv]c--d). The Bayesian *p*-value of this component was `r mean(m2$w_bpv)`, suggesting good fit (Appendix S2, [@fig-ppc]c).
+
+Finally, the intensity of mouthpart loss, as determined by the amount of dekeratinisation in the jaw sheaths, was associated with *Bd* infection status but infection status could not be included as a predictor due to the lack of uninfected individuals with mouthpart loss ([@fig-kaplam]c). Infection intensity was weakly positive associated with degree of oral dekeratinisation (standardised change `r median(m2$kappa_beta_1)` \[`r hdi(m2$kappa_beta_1)`\], RJMCMC inclusion `r mean(m2$kappa_w_1)`). For uninfected tadpoles, body size was positively associated with the degree of oral dekeratinisation (standardised change `r median(m2$kappa_beta_3)` \[`r hdi(m2$kappa_beta_3)`\], RJMCMC inclusion `r mean(m2$kappa_w_3)`). There was some amount of unexplained survey variation (SD of survey effect (`r median(m2$sigma_t_2_2)` \[`r hdi(m2$sigma_t_2_2)`\]). Goodness-of-fit of this component was good (Bayesian *p*-value `r mean(m2$v_bpv)`) (Appendix S2, [@fig-ppc]d).
+
+**\< @fig-kaplam could go here.\>**
+
+\newpage
+
+# Discussion
+
+We investigated the occurrence of *Bd* and associated infected intensities in endangered *Mixophyes fleayi* tadpoles over two years, and found that both average infection prevalence (`r median(expit(m2$logit_psi_alpha))` \[95% HPDI: `r hdi(expit(m2$logit_psi_alpha))`\]) and infection intensity (`r median(m2$mu_alpha)` \[`r hdi(m2$mu_alpha)`\] log~10~ gene copies per swab) were high. Compared to adults from the same sites reported in previous studies---which had an average reported prevalence of 0.15 \[95% HPDI: 0.07, 0.27\] and intensity of 3.036 \[95% HPDI: 2.836, 3.234\] [@hollanders2023]---the odds of tadpoles being infected with *Bd* were approximately `r round((median(expit(m2$logit_psi_alpha) / (1 - expit(m2$logit_psi_alpha)))) / (0.15 / (1 - 0.15)), 0)` times greater and average log~10~ infection intensities were `r median(m2$mu_alpha) / 3.036` times greater. We found evidence of seasonality for *Bd* infections in tadpoles, where lower temperatures were associated with higher *Bd* prevalence (but not *Bd* infection intensity). Additionally, we corroborated evidence for risk of infection increasing cumulatively with age, as we found a strong association between body size and infection prevalence. It is noteworthy that recently metamorphosed *M. fleayi* at Brindle Creek have lower average infection prevalence (estimated at 0.42 [95% HPDI: 0.13, 0.7] after correcting for imperfect detection in the swabbing process) and lower infection intensities (estimated at 2.8 [2.45, 3.08] log~10~ gene copies per swab) than the tadpoles [@hollanders2023a]. This discrepancy of infection patterns between larval and post-metamorphic individuals sharing a spatio-temporal space warrants further investigation and suggests considerable differences in immunocompetence, pathogen resistance, exposure history, or other mechanisms of persistence [@brannelly2021].
+
+Individual *Bd* infections of tadpoles was associated with lower temperatures and larger body sizes, consistent with results from previous studies (@fig-psi) [@cashins2009; @catenazzi2013; @valencia-aguilar2016; @sapsford2018]. Low temperatures also correlated with increased infection prevalence with adult amphibians at the same site, consistent with the regional pattern previously reported [@kriger2007; @hollanders2023]. The average six-weekly temperatures at the sites ranged from 8.6--19.8ºC, which is within the optimal range for *Bd* growth; nevertheless, growth is reportedly faster around 20ºC than it is around 10ºC, so *Bd* physiology may explain the observed pattern of infection prevalence at our sites [@piotrowski2004; @stevenson2013]. However, thermal optima vary among *Bd* strains and the performance of the local strain is unknown [@voyles2017]. Alternatively, immune function of tadpoles may be improved with higher temperatures [@cohen2017]. Although tadpole immune response to *Bd* is poorly understood, previous studies demonstrated that low-protein diets increased the probability of gaining *Bd* infections [@venesky2012] and tadpoles kept at lower temperatures had higher infection intensities [@altman2019], suggesting resistance to *Bd* is influenced by external factors. Further, some studies have reported regrowth of oral structures after initial dekeratinisation due to *Bd* infection, suggesting possible immune response after infection [@cashins2009; @hagman2015]. However, if tadpoles mounted successful immune responses to *Bd* infection, lower probability of being infected would be expected with larger body size, and/or lower infection intensities would be associated with these remaining infections. Contrary to this, we found evidence for infection status being strongly predicted by body size (a proxy for age), in line with previous studies [@valencia-aguilar2016; @sapsford2018]. This result is consistent with tadpoles experiencing a cumulative exposure risk and limited immune response to suppress *Bd* infections in the field.
+
+Unlike infection status, we did not find strong predictors influencing infection intensity. RJMCMC excluded all predictors except body size, which was found to have a weakly positive effect on infection intensity (@fig-mu); however, this may simply reflect that larger tadpoles have larger oral structures to swab. The lack of evidence for a temperature effect was noteworthy given the strength of the effect of temperature on infection status. This may reflect that *Bd* growth is largely independent of the range of temperatures that occur in these streams once *Bd* becomes established on a tadpole. Tadpoles did have considerably higher average infection intensities than adults (median of `r median(m2$mu_alpha)` vs. 3.0 log~10~ gene copies), which may in fact underestimate the difference given that tadpoles only have their oral structures swabbed (10 strokes) compared with the entire ventral surface of post-metamorphic animals [45 strokes, @hollanders2023]. That tadpoles in populations where adults display limited susceptibility to *Bd* after initial epidemics have higher infection intensities than adult frogs has also been found in *Rana sierrae/muscosa* in the United States [@briggs2010]. One explanation is that tadpoles exist in an environment that is more conducive to *Bd* growth due to the moisture and lower temperatures [@piotrowski2004]. Alternatively, an increased immune response may be present in adult individuals compared to tadpoles. With relatively fewer deleterious consequences of *Bd* infections for tadpoles, lower selective pressure would be expected compared to post-metamorphic animals experiencing mortality due to chytridiomycosis. Our results indicate that subtropical stream environments are suitable for high *Bd* prevalence in tadpoles throughout the year.
+
+Tadpoles of *Mixophyes fleayi* may be an important *Bd* reservoir due to the high infection prevalence and intensity and year-round presence in the streams [@rachowicz2004; @briggs2010; @cashins2009; @catenazzi2013; @courtois2017; @sapsford2018]. However, without an explicit causal or mechanistic model that accounts for transmission (i.e., shedding rates, exposure rates of vulnerable hosts, etc.), we cannot make claims about their status as a reservoir [@wilber2022]. Based on the body size distributions from December 2019--January 2021, pulses of reproduction occurred in the summer months (@fig-lengths-brindle), consistent with previous studies [@stratford2010]. Importantly, large tadpoles were present throughout the study period; given that larger tadpoles were more often infected, these individuals likely contribute to the maintenance of *Bd* in the stream environments. Experimental studies have shown that tadpoles readily infect other tadpoles when they share an aquatic environment [@rachowicz2007; @hagman2015; @courtois2017]. However, the extent to which adults become infected when entering these aquatic environments is less well understood. In laboratory studies, all post-metamorphic animals housed in an enclosure with infected tadpoles became infected within three weeks [@rachowicz2004]. However, the transmission of tadpoles to terrestrial adults is currently poorly understood. For stream-breeding frogs where breeding congregations occur in and around streams, understanding the risk of exposure from the stream environment is important for understanding infection dynamics. This remains an open area of research across many *Bd*-amphibian systems.
+
+To our knowledge, our study is the first to assess the effects of both *Bd* infection status and intensity on the probability of having oral dekeratinisation. Our results confirm that oral dekeratinisation is a good indicator of *Bd* infection in *Mixophyes fleayi*, with a `r median(1 - expit(logit(expit(m2$logit_lambda_alpha)) + m2$lambda_beta_1))` \[95% HPDI: `r hdi(1 - expit(logit(expit(m2$logit_lambda_alpha)) + m2$lambda_beta_1))`\] probability of an infected tadpole not displaying oral dekeratinisation [@symonds2007; @navarro-lozano2018]. We found that infected tadpoles had on average `r round(median(exp(m2$lambda_beta_1)), 0)` times higher odds to have mouthpart loss than uninfected tadpoles ([@fig-kaplam]a). Additionally, we found that among those tadpoles infected with *Bd*, individuals with a higher infection intensity were significantly more likely to have mouthpart loss ([@fig-kaplam]b). Only 13 tadpoles that had oral dekeratinisation returned negative swabs, but some of these were likely to be false-negatives. Our study did not correct for *Bd* detection errors in the swabbing process, which is predicted to be roughly `r 1 - (1 - 0.25)^median(m2$mu_alpha)` for the average tadpole infection intensity estimated in this study [@hollanders2023a]. Although other causes of oral dekeratinisation exist [@knapp2006], given the prevalence of *Bd* at our sites and the clear association with *Bd*, these individuals likely lost their mouthparts due to infection. The positive effect of body size on the degree of oral dekeratinisation for uninfected tadpoles may also suggest that prior infections caused the dekeratinisation, and that tadpoles had successfully cleared infection or that our detection protocol failed to detect *Bd* in these tadpoles. Importantly, the probability of finding two tadpoles with oral dekeratinisation that are not infected with *Bd* is just `r options(digits = 4) ; m2$logit_lambda_alpha |> median() |> expit() |> pow(2)`; consequently, the presence of mouthpart loss in a small sample of tadpoles should allow investigators to conclude the presence of *Bd*. Unfortunately, the relationship between oral dekeratinisation and *Bd* infection appears highly species-specific: although the relationship is present for many species, some species show mouthpart loss in the absence of *Bd* [@navarro-lozano2018]. `r options(digits = 3)`
+
+In conclusion, we have shown that *Bd* infection prevalence and infection intensity in tadpoles are considerably higher than for adults and juveniles at the same sites. Our focal species *Mixophyes fleayi* declined significantly during the epidemic but has since recovered, having stable populations despite individual mortality occurring with high *Bd* intensities [@hollanders2023]. Nevertheless, the year-round presence of tadpoles that are more often infected and infected with higher pathogen loads in the stream environments may constitute a *Bd* reservoir, both in terms of indirect transmission through the water and directly into the adult population through metamorphosis. However, to establish the role of tadpoles as pathogen reservoirs, future research will need to quantify transmission to more vulnerable hosts. The results of this work suggest fruitful future research into mechanisms of immunocompetence across amphibian life stages 
+
+\newpage
+
+# Ethics
+
+Field surveys were performed under New South Wales Scientific License 102444 with Southern Cross University Animal Care and Ethics Committee approval (Animal Research Authority 20034).
+
+# Data availability statement
+
+All data, analysis scripts, and posterior samples are available at [https://github.com/mhollanders/mfleayi-tadpoles](https://github.com/mhollanders/mfleayi-tadpoles).
+
+# Conflicts of interests
+
+The author have no conflicts of interests to report.
+
+# Declaration of funding
+
+This project was funded by the New South Wales Government’s Saving our Species program wish specific thanks to Jill Smith and David Hunter. L.G. was supported by Australian Research Council (ARC) grants DP180101415 and DE200100490. H.M. and D.N. were supported by ARC grant DP180101415.
+
+# Acknowledgements
+
+We extend special thanks to New South Wales National Parks and Wildlife Service for allowing us to conduct field work. We thank volunteers Darren McHugh, Liam Bolitho, Madelyn Mangan, and Josephine Humphries for asisstance in the field.
+
+\newpage
+
+# Tables
+
+```{=tex}
+\small
+```
+
+| **Function**                        | **Parameter**                         | **Median**                               | **95% HPDI**                              | **RJMCMC**              | **Prior**                    |
+|-------------------------------------|---------------------------------------|------------------------------------------|-------------------------------------------|-------------------------|------------------------------|
+| *Bd* infection status ($\psi$)      |                                       |                                          |                                           |                         |                              |
+|                                     | Intercept                             | `r median(expit(m2$logit_psi_alpha))`    | \[`r hdi(expit(m2$logit_psi_alpha))`\]    |                         | $\text{Beta}(3,3)$           |
+|                                     | Temp\*                                | `r median(m2$psi_beta_1)`                | \[`r hdi(m2$psi_beta_1)`\]                | `r mean(m2$psi_w_1)`    | $\textit{t}_3(0, 1)$         |
+|                                     | Body size\*                           | `r median(m2$psi_beta_2)`                | \[`r hdi(m2$psi_beta_2)`\]                | `r mean(m2$psi_w_2)`    | $\textit{t}_3(0, 1)$         |
+|                                     | Site                                  | `r median(m2$psi_beta_3)`                | \[`r hdi(m2$psi_beta_3)`\]                | `r mean(m2$psi_w_3)`    | $\textit{t}_3(0, 1)$         |
+|                                     | Temp $\times$ body size               | `r median(m2$psi_beta_4)`                | \[`r hdi(m2$psi_beta_4)`\]                | `r mean(m2$psi_w_4)`    | $\textit{t}_3(0, 1)$         |
+|                                     | Temp $\times$ site                    | `r median(m2$psi_beta_5)`                | \[`r hdi(m2$psi_beta_5)`\]                | `r mean(m2$psi_w_5)`    | $\textit{t}_3(0, 1)$         |
+|                                     | Body size $\times$ site               | `r median(m2$psi_beta_6)`                | \[`r hdi(m2$psi_beta_6)`\]                | `r mean(m2$psi_w_6)`    | $\textit{t}_3(0, 1)$         |
+|                                     | Temp $\times$ body size $\times$ site | `r median(m2$psi_beta_7)`                | \[`r hdi(m2$psi_beta_7)`\]                | `r mean(m2$psi_w_7)`    | $\textit{t}_3(0, 1)$         |
+|                                     | Survey (SD)                           | `r median(m2$sigma_t_1_1)`               | \[`r hdi(m2$sigma_t_1_1)`\]               |                         | $\textit{t}^+_3(0, 1)$       |
+|                                     | *Bd* detection probability ($r$)      | `r median(m2$r)`                         | \[`r hdi(m2$r)`\]                         |                         | $\text{Beta}(6, 4)$          |
+|                                     | *Bd* false-positive ($\delta_{21}$)   | `r median(m2$delta21)`                   | \[`r hdi(m2$delta21)`\]                   |                         | $\text{Beta}(1, 10)$         |
+| *Bd* infection intensity ($\mu$)    |                                       |                                          |                                           |                         |                              |
+|                                     | Intercept                           | `r median(m2$mu_alpha)`                  | \[`r hdi(m2$mu_alpha)`\]                  |                         | $\textit{t}_3(4, 1)$         |
+|                                     | Temp                                  | `r median(m2$mu_beta_1)`                 | \[`r hdi(m2$mu_beta_1)`\]                 | `r mean(m2$mu_w_1)`     | $\textit{t}_3(0, 1)$         |
+|                                     | Body size\*                           | `r median(m2$mu_beta_2)`                 | \[`r hdi(m2$mu_beta_2)`\]                 | `r mean(m2$mu_w_2)`     | $\textit{t}_3(0, 1)$         |
+|                                     | Site                                  | `r median(m2$mu_beta_3)`                 | \[`r hdi(m2$mu_beta_3)`\]                 | `r mean(m2$mu_w_3)`     | $\textit{t}_3(0, 1)$         |
+|                                     | Temp $\times$ body size               | `r median(m2$mu_beta_4)`                 | \[`r hdi(m2$mu_beta_4)`\]                 | `r mean(m2$mu_w_4)`     | $\textit{t}_3(0, 1)$         |
+|                                     | Temp $\times$ site                    | `r median(m2$mu_beta_5)`                 | \[`r hdi(m2$mu_beta_5)`\]                 | `r mean(m2$mu_w_5)`     | $\textit{t}_3(0, 1)$         |
+|                                     | Body size $\times$ site               | `r median(m2$mu_beta_6)`                 | \[`r hdi(m2$mu_beta_6)`\]                 | `r mean(m2$mu_w_6)`     | $\textit{t}_3(0, 1)$         |
+|                                     | Temp $\times$ body size $\times$ site | `r median(m2$mu_beta_7)`                 | \[`r hdi(m2$mu_beta_7)`\]                 | `r mean(m2$mu_w_7)`     | $\textit{t}_3(0, 1)$         |
+|                                     | Survey (SD)                           | `r median(m2$sigma_t_1_2)`               | \[`r hdi(m2$sigma_t_1_2)`\]               |                         | $\textit{t}^+_3(0, 1)$       |
+|                                     | Population SD ($\exp\sigma_\mu$)      | `r median(exp(m2$mu_sigma_1))`           | \[`r hdi(exp(m2$mu_sigma_1))`\]           |                         | $\textit{t}^+_3(0, 1)$       |
+|                                     | Swab error ($\sigma_\text{swab}$)     | `r median(m2$mu_sigma_2)`                | \[`r hdi(m2$mu_sigma_2)`\]                |                         | $\textit{t}^+_3(0.17, 0.11)$ |
+|                                     | qPCR error ($\sigma_\text{qPCR}$)     | `r median(m2$mu_sigma_3)`                | \[`r hdi(m2$mu_sigma_3)`\]                |                         | $\textit{t}^+_3(0.5, 0.05)$  |
+| Mouthpart loss status ($\lambda$)   |                                       |                                          |                                           |                         |                              |
+|                                     | Intercept                             | `r median(expit(m2$logit_lambda_alpha))` | \[`r hdi(expit(m2$logit_lambda_alpha))`\] |                         | $\text{Beta}(1, 10)$         |
+|                                     | *Bd* infection status\*               | `r median(m2$lambda_beta_1)`             | \[`r hdi(m2$lambda_beta_1)`\]             | `r mean(m2$lambda_w_1)` | $\textit{t}_3(0, 1)$         |
+|                                     | *Bd* infection intensity\*            | `r median(m2$lambda_beta_2)`             | \[`r hdi(m2$lambda_beta_2)`\]             | `r mean(m2$lambda_w_2)` | $\textit{t}_3(0, 1)$         |
+|                                     | Body size (if *Bd*+)                  | `r median(m2$lambda_beta_3)`             | \[`r hdi(m2$lambda_beta_3)`\]             | `r mean(m2$lambda_w_3)` | $\textit{t}_3(0, 1)$         |
+|                                     | Body size (if *Bd*--)                  | `r median(m2$lambda_beta_4)`             | \[`r hdi(m2$lambda_beta_4)`\]             | `r mean(m2$lambda_w_4)` | $\textit{t}_3(0, 1)$         |
+|                                     | Survey (SD)                           | `r median(m2$sigma_t_2_1)`               | \[`r hdi(m2$sigma_t_2_1)`\]               |                         | $\textit{t}^+_3(0, 1)$       |
+| Mouthpart loss intensity ($\kappa$) |                                       |                                          |                                           |                         |                              |
+|                                     | *Bd* infection intensity              | `r median(m2$kappa_beta_1)`              | \[`r hdi(m2$kappa_beta_1)`\]              | `r mean(m2$kappa_w_1)`  | $\textit{t}_3(0, 1)$         |
+|                                     | Body size (if *Bd*+)                  | `r median(m2$kappa_beta_2)`              | \[`r hdi(m2$kappa_beta_2)`\]              | `r mean(m2$kappa_w_2)`  | $\textit{t}_3(0, 1)$         |
+|                                     | Body size (if *Bd*--)\*                | `r median(m2$kappa_beta_3)`              | \[`r hdi(m2$kappa_beta_3)`\]              | `r mean(m2$kappa_w_3)`  | $\textit{t}_3(0, 1)$         |
+|                                     | Survey (SD)                           | `r median(m2$sigma_t_2_2)`               | \[`r hdi(m2$sigma_t_2_2)`\]               |                         | $\textit{t}^+_3(0, 1)$       |
+
+: Posterior (with median and 95% HPDI) and prior distributions for the *Bd* infection status and intensity and the mouthpart loss status and intensity model components. Stars indicate predictors for which the 95% HPDI did not overlap 0. The *Bd* detection probability ($r$) is the probability of detecting one log~10~ gene copy of *Bd* in a qPCR run, and the false positive probability ($\delta_{21}$) is the probability of getting a positive detection during qPCR when the sample was not truly infected with *Bd*. {#tbl-m2} {tbl-colwidths="\[19,30,11,16,12,12\]"}
+
+```{=tex}
+\normalsize
+```
+
+\newpage
+
+
+# Figures
+
+![Size distributions of *Mixophyes fleayi* tadpoles per survey at Brindle Creek over one year.](../figs/fig-lengths-brindle.png){#fig-lengths-brindle}
+
+\newpage
+
+![Various stages of oral dekeratinization in tadpoles of *Mixophyes fleayi*. The oral dekeratinisation scores of top/bottom jaw sheats were **(a)** NA/NA, **(b)** 1/3, **(c)** 3/4, and **(d)** 5/5.](../figs/fig-mouths.jpg){#fig-mouths}
+
+\newpage
+
+![Survey-specific estimates (medians and 95% HPDIs) of **(a)** *Bd* infection prevalence, **(b)** average *Bd* infection intensity (log~10~ gene copies per swab), **(c)** oral dekeratinisation prevalence, and **(d)** average oral dekeratinisation score of tadpoles with dekeratinisation. Estimates were averaged over individual-level predictions for each survey.](../figs/fig-surv.png){#fig-surv}
+
+\newpage
+
+![Prediction curves (medians and 95% HPDIs) with the coefficients of temperature **(a)** and body size **(b)** on the probability of *Mixophyes fleayi* tadpoles being infected with *Bd* from logistic regression, with the other (scaled) predictors held at their respective means. Points are observed individuals with corresponding temperature **(a)** and body size **(b)** at observation, categorised by *Bd* infection status (infected, top; uninfected, bottom). Body sizes were transformed from mouthpart widths using the equation in @fig-lengths.](../figs/fig-psi.png){#fig-psi}
+
+\newpage
+
+![**(a)** Posterior distributions (with medians and 95% HPDIs) of the probability of having mouthpart loss, as determined by the presence of dekeratinisation of the jaw sheath, for *Mixophyes fleayi* tadpoles uninfected (left) and infected (right) with *Bd*. Jittered points are observed individuals, categorised by presence of mouthpart loss (present, top; absent, bottom) and *Bd* infection status. **(b)** Prediction curve (median and 95% HPDI) with the coefficient of *Bd* infection intensity on the probability of having mouthpart loss from logistic regression. Points are observed individuals with corresponding *Bd* infection intensities estimated by the model (summarised as the median of the posterior distributions) after accounting for measurement error in the sampling (swabbing) and diagnostic (qPCR) processes. **(c)** Posterior distribution (with median and 95% HPDI) of the average mouthpart loss intensity score for infected (right) tadpoles (there was not enough data to estimate the score of uninfected tadpoles). Points are observed mouthpart loss intensity scores.](../figs/fig-kaplam.png){#fig-kaplam}
+
+\newpage
+
+# References
+
+::: {#refs}
+:::
+
+\newpage
+
+```{=tex}
+\beginsupplement
+```
+
+# Appendix S1: Supplementary figures {.appendix}
+
+![Scatterplot of mouthpart width as measured from photographs in pixels using Adobe Photoshop compared to body length measured with calipers in the field. The posterior predictive distribution (summarised with median and 95% HPDI) is from a log-log regression.](../figs/fig-lengths.png){#fig-lengths}
+
+\newpage
+
+![Posterior predictive distribution (summarised with median and 95% HPDI) for the effect of log body size (transformed from mouthpart widths using the equation in @fig-lengths) on *Bd* infection intensity (log~10~ gene copies per swab) of *Mixophyes fleayi* tadpoles. Blue points are observed individual *Bd* infection intensities, averaged over positive qPCR runs. Red points are posterior medians of individual infection intensities estimated by the model ($m_i$, Appendix S2) after propagating measurement error in the sampling (swabbing) and diagnostic (qPCR) processes.](../figs/fig-mu.png){#fig-mu}
+
+\newpage
+
+# Appendix S2: Statistical analysis of infection prevalence, infection intensity, and mouthpart loss {.appendix}
+
+To identify patterns in *Bd* infection status (infected/uninfected) and infection intensity (pathogen load), we fit a model to swab infection status and (log~10~) swab loads, respectively, correcting for measurement error in the qPCR and the sampling processes. Our model closely follows the model of @direnzo2018, except that we used an informative prior for the sampling process measurement error, applied the Royle-Nichols [-@royle2003] model for pathogen detection probabilities, and further incorporated mouthpart loss status and intensity as descendant variables from *Bd* infection. Predictors were centered and scaled by two standard deviations to allow direct comparison between binary (site) and continuous (temperature and body size) effects [@gelman2008a]. We used reversible jump MCMC [RJMCMC, @green1995] for predictor variable selection and constrained interaction effects to occur in the presence of respective main effects. We ran 4 chains for 50,000 iterations after discarding 10,000 as burn-in and thinning chains by 10, yielding 20,000 posterior samples. We summarised posterior distributions with medians and 95% highest posterior density intervals (HPDI) with RJMCMC inclusion probabilities, and considered effects important when 95% HPDIs of the coefficients did not overlap 0. We conducted posterior predictive checks (PPCs) for all four model components. The fully reproducible analysis is available at [https://github.com/mhollanders/mfleayi-tadpoles](https://github.com/mhollanders/mfleayi-tadpoles).
+
+## Infection status
+
+We modeled the latent true infection status ($z_i$) of tadpole $i \in 1,\dots,I=865$ as a Bernoulli random variable:
+
+$$
+z_i \sim \operatorname{Bernoulli} \left( \psi_i \right)
+$$ {#eq-z}
+
+where the individual probability of being infected with *Bd* ($\psi_i$) was modeled as a logit-linear function of covariates (site, temperature, log body size, and two/three-way interactions) and random survey effects. Note that 244 missing body size observations were imputed from the distribution of 621 observed values with MCMC.
+
+The observed infection status ($y_{ij}$, data) during replicate qPCR run $j \in 1,2$ was modeled---like an occupancy model---as a Bernoulli variable conditional on being infected ($z_i = 1$) and the probability of detecting *Bd* on the infected sample using qPCR ($\delta_i$):
+
+$$
+y_{ij} \sim \operatorname{Bernoulli} \left( z_i \delta_i \right)
+$$ {#eq-y}
+
+where $\delta_i$ was modeled as a function of swab infection intensity ($n_i$, see below), with $r$ being the probability of detecting one log~10~ *Bd* gene copy on an infected sample in a qPCR run [@royle2003; @hollanders2022]:
+
+$$
+\delta_i = 1 - \left( 1 - r \right) ^ {n_i}
+$$ {#eq-delta}
+
+## Infection intensity
+
+We modeled the latent individual infection intensity ($m_i$) with a normal linear model:
+
+$$
+m_i \sim \operatorname{Normal} \left( \mu_i, \sigma^2_\mu \right)
+$$ {#eq-m}
+
+where the expected infection intensity ($\mu_i$) was modeled as a linear function of covariates (site, temperature, body size, and covariates) and random survey effects, and $\sigma_\mu$ is the  population standard deviation. Random survey effects of infection status and intensity were modeled as draws from a bivariate normal distribution to explore potential correlations.
+
+Knowing that there is measurement error associated with swab samples, but not having replicate samples to estimate this error for tadpoles, we relied on results from replicate samples collected from juveniles [@hollanders2022] to estimate the sample infection intensity ($n_i$):
+
+$$
+n_i \sim \operatorname{Normal} \left( m_i, \sigma^2_\text{swab} \right)
+$$ {#eq-n}
+
+where the measurement error of the swabbing process ($\sigma_\text{swab}$) was given an informative prior (see @tbl-m2 and **Priors** below).
+
+We modeled the observed infection intensity ($x_{ij}$, data) during replicate qPCR runs with a normal distribution centered on the sample infection intensity:
+
+$$
+x_{ij} \sim \operatorname{Normal} \left( n_i, \sigma^2_\text{qPCR} \right)
+$$ {#eq-x}
+
+where $\sigma_\text{qPCR}$ is the measurement error of the qPCR process.
+
+## Mouthpart loss
+
+Next, we modeled the observed mouthpart loss status ($w_i$, data), as determined by the presence of dekeratinisation in either of the two jaw sheaths, as a Bernoulli variable:
+
+$$
+w_i \sim \operatorname{Bernoulli} \left( \lambda_i \right)
+$$ {#eq-w}
+
+where the individual probability of having jaw sheath loss ($\lambda_i$) was modeled as a logit-linear function of estimated *Bd* infection status ($z_i$), *Bd* infection intensity ($m_i$), separate coefficients for body size with uninfected and infected tadpoles, and random survey effects (survey effects not shown):
+
+$$
+\operatorname{logit} \lambda_i = \alpha_\lambda + {\beta_\lambda}_1 z_i + {\beta_\lambda}_2 z_i \frac{m_i - \alpha_\mu}{2 \sigma_\mu} + {\beta_\lambda}_3 z_i \textrm{size}_i + {\beta_\lambda}_4 \left( 1 - z_i \right) \textrm{size}_i
+$$ {#eq-lambda}
+
+Note that the effect of *Bd* infection intensity (${\beta_\lambda}_2$) was only included for those individuals that were infected ($z_i = 1$), and that infection intensity was centered (by subtracting the average infection intensity $\alpha_\mu$) and scaled by two standard deviations $2\sigma_\mu$. This ensured that the interpretation of ${\beta_\lambda}_1$ is the log odds change of having mouthpart loss due to an individual being infected with *Bd* carrying the average infection intensity, and that ${\beta_\lambda}_2$ was on the same scale as all other predictors.
+
+Finally, we modeled the observed mouthpart loss intensity ($v_i$, data), quantified as the sum of the ordinal scores between 1--5 of both the top and bottom jaw sheaths for those individuals where mouthpart loss was detected, as an ordered probit regression with $s \in 1,\dots,S=10$ possible scores:
+
+$$
+\begin{aligned}
+  v_i &\sim \operatorname{Categorical} \left( {\kappa_{[1 \dots S]}}_i \right) \\
+  {\kappa_{[1]}}_i &= \Phi \left( \tau_1 - {\mu_\kappa}_i \right) \\
+  {\kappa_{[2 \dots S-1]}}_i &= \Phi \left( \tau_{[2:S-1]} - {\mu_\kappa}_i \right) - \Phi \left( \tau_{[ \left( 2 \dots S-1 \right)-1]} - {\mu_\kappa}_i \right) \\
+  {\kappa_{[S]}}_i &= 1 - \Phi \left( \tau_{[S-1]} - {\mu_\kappa}_i \right)
+\end{aligned}
+$$ {#eq-v}
+
+where $\kappa$ is a probability simplex (summing to 1) of length $S$, $\Phi$ is the cumulative standard normal distribution function (with standard deviation fixed at 1), $\tau$ is a vector of $S-1$ thresholds modeled as $\tau_{s} \sim \operatorname{Normal} \left( \alpha_\tau + \beta_\tau \left( s - S/2 \right), \sigma^2_\tau \right)$, and ${\mu_\kappa}_i$ is the mean of the standard normal modeled as a linear function of *Bd* infection intensity, body size, and random survey effects (not shown). Infection status was omitted from the model due to the lack of uninfected individuals with mouthpart loss and the resulting poor estimability of that parameter. Random survey effects of mouthpart loss status and intensity were also modeled as correlated using a bivariate normal distribution.
+
+## Priors
+
+We used a mixture of vague, weakly informative, and informative priors (@tbl-m2). We specified a $\operatorname{Beta} \left( 3,3 \right)$ prior for the back-transformed intercept of *Bd* infection status and a weakly informative Student-*t* prior on the intercept of the log-linear function of infection intensity, centered on the observed average swab infection intensity. We used a conservatively informative $\operatorname{Beta} \left( 1,10 \right)$ prior on the probability of having mouthpart loss for uninfected tadpoles to reflect the low incidence in the sample (5%). We used weakly informative $\textit{t}_3 \left( 0,1 \right)$ priors on all coefficients [with predictors standardised by two standard deviations, @gelman2008a] to ensure some regularisation and improved MCMC mixing, while allowing for more extreme coefficients. Similarly, we used $\textit{t}^+_3 \left( 0,1 \right)$ priors on standard deviation parameters, except for the measurement of the swabbing and qPCR processes. Since we did not collect replicate swab samples to estimate this error, we relied on previous work on replicate samples of juvenile *Mixophyes fleayi* from Brindle Creek, using that estimate for a $\textit{t}^+_3 \left( 0.17, 0.11 \right)$ prior  [@hollanders2022]. Again, we applied a *t* prior as the thicker tails allow for deviating values. Although we did have data to estimate the measurement error of the qPCR process, we still used an informative $\textit{t}_3^+ \left( 0.5, 0.05 \right)$ prior because the previous work applied the same diagnostic protocol. We specified a somewhat informative $\operatorname{Beta} \left( 6,4 \right)$ for the probability of detecting one log~10~ *Bd* gene copy with qPCR [@hollanders2022]. We applied $\operatorname{LKJ} \left( 2 \right)$ priors on the Cholesky factors of the correlation matrices of correlated random survey effects. For the ordinal threshold parameters, we specified a $\operatorname{Normal} \left( 0,1 \right)$ for the intercept $\tau_\alpha$ and an $\operatorname{Normal}^+ \left( 0,1 \right)$ for $\tau_\beta$ to reflect the constraint that thresholds are ordered. We set a $\operatorname{Beta} \left(1,1 \right)$ prior for the RJMCMC inclusion probability.
+
+## Posterior predictive checks
+
+We conducted PPCs for the *Bd* infection prevalence, infection intensity, and mouthpart loss components of the tadpole model. For each of 20,000 MCMC samples, we simulated replicate infection status ($y^\text{rep}$) and intensity ($x^\text{rep}$), and mouthpart loss ($w^\text{rep}$) and intensity ($v^\text{rep}$) datasets from the joint posterior distribution and computed fit statistics for both the observed data and replicate datasets.
+
+For infection status, the binary response was not suitable for test statistics such as $\chi^2$ or Freeman-Tukey statistics, and responses are usually binned across some useful categories as a solution [@kery2012]. In our model, we first summed infection status of individual $i$ across duplicate qPCR run $j$ ($y_{ij}$ and $y^\text{rep}_{ij}$) and then binned results for each (*n* = 25) survey $t \in 1,\dots,T=25$, yielding ${y_\text{survey}}_t$ and ${y^\text{rep}_\text{survey}}_t$. For the individual expected value ($E_i$), we used $2\psi_i \delta_i$ (to incorporate both the latent expected infection prevalence \[$\psi$\], the probability of detecting *Bd* \[$\delta$\], and the number of qPCR runs \[2\]), which were also summed for each survey, yielding ${E_\text{survey}}_t$. The fit statistics used were Freeman-Tukey statistics calculated for each survey $t$, leading to the discrepancy measures ($D_y$ and $D^\text{rep}_y$) calculated below:
+
+$$
+\begin{aligned}
+  D_y &= \sum_{t = 1}^{25} \left( \sqrt{{y_\text{survey}}_t} - \sqrt{{E_\text{survey}}_t} \right)^2 \\
+  D^\text{rep}_y &= \sum_{t = 1}^{25} \left( \sqrt{{y^\text{rep}_\text{survey}}_t} - \sqrt{{E_\text{survey}}_t} \right)^2
+\end{aligned}
+$$ {#eq-ppc-y}
+For infection intensity, we used $\chi^2$ fit statistics on observed and replicated infection intensity of qPCR runs ($x_{ij}$) with $\mu_i$ as the expectation. The discrepancy measures were the fit statistics summed over all individuals and qPCR runs:
+
+$$
+\begin{aligned}
+  D_x &= \sum_{i = 1}^{865} \sum_{j = 1}^2 \frac{ \left( x_{ij} - \mu_i \right)^2}{\mu_i} \\
+  D^\text{rep}_x &= \sum_{i = 1}^{865} \sum_{j = 1}^2 \frac{ \left( x^\text{rep}_{ij} - \mu_i \right)^2}{\mu_i}
+\end{aligned}
+$$ {#eq-ppc-x}
+For mouthpart loss status, we also binned observed and replicated data, along with individual expected value $\lambda_i$, across surveys, and calculated Freeman-Tukey statistics, summing across surveys to yield the discrepancy measures:
+
+$$
+\begin{aligned}
+  D_w &= \sum_{t = 1}^{25} \left( \sqrt{{w_\text{survey}}_t} - \sqrt{{E_\text{survey}}_t} \right)^2 \\
+  D^\text{rep}_w &= \sum_{t = 1}^{25} \left( \sqrt{{w^\text{rep}_{\text{survey}}}_t} - \sqrt{{E_\text{survey}}_t} \right)^2
+\end{aligned}
+$$ {#eq-ppc-w}
+For mouthpart loss intensity, we used $\chi^2$ statistics on observed and replicated intensity ($v_i$) with $\sum_{s = 1}^{S}{\kappa_s}_i s$ as the expectation, which were subsequently summed over all individuals to arrive at the discrepancy measures:
+
+$$
+\begin{aligned}
+  D_v &= \sum_{i = 1}^{865} \sum_{s = 1}^{10} \frac{ \left(v_i - \sum_{s = 1}^{10}{\kappa_s}_i s \right)^2}{\sum_{s = 1}^{10}{\kappa_s}_i s} \\
+  D^\text{rep}_v &= \sum_{i = 1}^{865} \sum_{s = 1}^{10} \frac{ \left( v^\text{rep}_i - \sum_{s = 1}^{10}{\kappa_s}_i s \right)^2}{\sum_{s = 1}^{10}{\kappa_s}_i s}
+\end{aligned}
+$$ {#eq-ppc-v}
+
+We then visually inspected the discrepancies by plotting the discrepancy of the simulated datasets against the discrepancy of the observed dataset for all 20,000 MCMC samples (@fig-ppc), and calculated the Bayesian *p*-values (BPVs) as the proportion of samples where the discrepancy of simulated data was greater than the discrepancy of the observed data ($\Pr \left( D^\text{rep} > D \right)$).
+
+![Discrepancy measures from simulated datasets ($D^\text{rep}$) versus observed data ($D$) for each of 20,000 MCMC samples for **(a)** *Bd* infection prevalence (calculated from Freeman-Tukey statistics), **(b)** *Bd* infection intensity (calculated from $\chi^2$ statistics), **(c)** mouthpart loss status (calculated from Freeman-Tukey statistics), and **(d)** mouthpart loss intensity (calculated from $\chi^2$ statistics). Bayesian *p*-values (BPVs) are the proportion of MCMC samples for which the discrepancy of replicated data was greater than the discrepancy of the observed data ($\Pr \left( D^\text{rep} > D \right)$). The color red indicates when $D^\text{rep} > D$.](../figs/fig-ppc.png){#fig-ppc}

@@ -1,0 +1,1228 @@
+---
+title: Statistical analysis of tadpole data
+author: Matthijs Hollanders
+editor_options: 
+  chunk_output_type: console
+---
+
+# Packages
+
+```{r}
+# packages
+if (!require(pacman)) install.packages("pacman")
+pacman::p_load(tidyverse, janitor, nimble, nimbleNoBounds, parallel, MCMCvis, ggforce, ggblend, ggdist, ggtext, patchwork, MetBrewer, latex2exp)
+```
+
+# Data
+
+## Raw data and manipulation
+
+```{r}
+# function to standardise by two standard deviations
+scl <- function(x, unique = F) {
+  if (unique == F) {
+    (x - mean(x, na.rm = T)) / (2 * sd(x, na.rm = T))
+  } else {
+    (x - mean(unique(x), na.rm = T)) / (2 * sd(unique(x), na.rm = T))
+  }
+}
+
+# infections and mouthpart loss data
+tads <- read_csv("data/tadpole-data.csv") |>
+  mutate(
+    # convert date to actual date
+    date = dmy(date),
+    # site as factor
+    site = factor(site, levels = c("brindle", "tuntable")),
+    # binary infection status
+    infected = ifelse(load > 0, 1, 0),
+    # scale temperature data and mouthpart width
+    temp_scl = scl(temp_air, unique = T),
+    mouth_scl = scl(mouth),
+    # total jaw loss score
+    jaw = jawtop + jawbottom,
+    # binary jaw loss 
+    jaw_bin = ifelse(jaw > 0, 1, 0)) |>
+  glimpse()
+
+# length measured with calipers vs. mouthpart width measured in pixels
+lengths <- read_csv("data/lengths.csv") |>
+  glimpse()
+
+# additional lengths measured for each survey
+lengths2 <- read_csv("data/tadpole-lengths.csv") |>
+  mutate(site = factor(site, levels = c("brindle", "tuntable")),
+         date = dmy(date)) |>
+  glimpse()
+```
+
+## Prepare data for NIMBLE
+
+```{r}
+# infection intensity
+x <- tads |>
+  # select the two qPCR runs
+  select(starts_with("pcr")) |>
+  # multiply by 140 to correct for dilution
+  mutate(across(everything(), \(x) x * 140)) |>
+  # convert to matrix
+  as.matrix() |>
+  # log10 transform
+  log10()
+
+# infection status
+y <- ifelse(is.na(x), 0, 1)
+
+# mouthpart loss intensity
+v <- na_if(tads$jaw, 0)
+
+# mouthpart loss status
+w <- tads$jaw_bin
+
+# metadata
+n_ind <- nrow(tads)
+n_survey <- length(unique(tads$date))
+n_score <- max(tads$jaw, na.rm = T) 
+survey <- as.numeric(factor(tads$date))
+survey
+
+# get indices of rows corresponding to each survye
+survey_first <- survey_last <- c()
+for (i in 1:n_survey) {
+  survey_first[i] <- min(which(survey == i))
+  survey_last[i] <- max(which(survey == i))
+}
+
+# mean observed infection intensity
+mu_alpha_prior <- apply(x, 1, \(x) 
+                        ifelse(!all(is.na(x)),
+                               mean(x, na.rm = T),
+                               NA)) |>
+  mean(na.rm = T) |>
+  glimpse()
+
+# MCMC details
+n_iter <- 6e4 ; n_burnin <- 1e4 ; n_thin <- 1e1 ; n_chains <- 4
+```
+
+# Models
+
+## Body length vs. pixel length
+
+For some individuals, body length was measured from the tip of the snout to the base of the tail using calipers to the nearest mm, in addition to the mouthpart widths measured in pixels. To determine whether the pixel length measurements were a good proxy for body length, we fit a log-log regression model. We also included as measurement error model because the body lengths were measured to the nearest mm, which is a much coarser resolution than the pixels.
+
+```{r}
+# model code
+m1_code <- nimbleCode({
+  # priors
+  beta[1] ~ dnorm(0, sd = 5)
+  beta[2] ~ dnorm(0, 1)
+  sigma ~ dexp(1)
+  # likelihood
+  for (i in 1:n_ind) {
+    mouth[i] ~ dnorm(beta[1] + beta[2] * body[i], sd = sigma)
+  } # i
+})
+
+# constants, data, and parameters to monitor
+m1_consts <- list(n_ind = nrow(lengths),
+                  body = log(lengths$length)) |> glimpse()
+m1_data <- list(mouth = log(lengths$mouth)) |> glimpse()
+m1_mons <- c("beta", "sigma")
+
+# model and MCMC compilation
+m1_Cmodel <- nimbleModel(m1_code, m1_consts, m1_data) |>
+  compileNimble()
+m1_Cmcmc <- buildMCMC(m1_Cmodel, monitors = m1_mons) |>
+  compileNimble(project = m1_Cmodel, resetFunctions = T)
+
+# MCMC sampling
+m1_fit <- runMCMC(m1_Cmcmc, niter = n_iter, nburnin = n_burnin, thin = n_thin, nchains = n_chains)
+
+# save model object and MCMC samples
+write_rds(m1_fit, "mcmc/m1-fit.rds")
+m1_samples <- do.call(rbind, m1_fit)
+write.csv(m1_samples, "mcmc/m1-samples.csv")
+
+# summary and traceplots
+MCMCsummary(m1_fit, round = 3)
+MCMCtrace(m1_fit, ind = T, n.eff = T, Rhat = T,
+          filename = "mcmc/m1-trace.pdf")
+```
+
+## Infections and mouthpart loss 
+
+### Model code 
+
+```{r}
+# Code
+m2_code <- nimbleCode({
+  
+  # priors
+  
+  # constraints on interaction effects (marginality)
+  constraint_int ~ dconstraint(prod(psi_w[1:2]) >= psi_w[4] 
+                               & (psi_w[1] * psi_w[3]) >= psi_w[5]
+                               & prod(psi_w[2:3]) >= psi_w[6]
+                               & prod(psi_w[4:6]) >= psi_w[7] 
+                               & prod(mu_w[1:2]) >= mu_w[4] 
+                               & (mu_w[1] * mu_w[3]) >= mu_w[5]
+                               & prod(mu_w[2:3]) >= mu_w[6]
+                               & prod(mu_w[4:6]) >= mu_w[7]
+                               & lambda_w[1] >= lambda_w[2]
+                               & lambda_w[1] >= lambda_w[3]
+                               & lambda_w[1] >= lambda_w[4]
+                               )
+  
+  # constraint on ordinal thresholds
+  for (s in 1:(n_score - 2)) {
+    constraint_tau[s] ~ dconstraint(tau[s] < tau[s + 1])
+  }
+  
+  # constraint on false-positive
+  constraint_delta ~ dconstraint(delta21 < r)
+  
+  # RJMCMC inclusion probability
+  rj ~ dbeta(2, 2)
+  
+  # Bd infections
+  logit_psi_alpha ~ dLogitBeta(3, 3)
+  mu_alpha ~ dnorm(mu_alpha_prior, 1)
+  for (j in 1:7) {
+    psi_w[j] ~ dbern(rj)
+    psi_beta[j] ~ dt(0, sigma = 1, df = 3)
+    mu_w[j] ~ dbern(rj)
+    mu_beta[j] ~ dt(0, sigma = 1, df = 3)
+  } # j
+  mu_sigma[1] ~ dexp(1)
+  mu_sigma[2] ~ T(dt(0.18, sigma = 0.11, df = 3), 0, )
+  mu_sigma[3] ~ T(dt(0.5, sigma = 0.05, df = 3), 0, )
+  
+  # Bd detection
+  r ~ dbeta(6, 4)
+  delta21 ~ dbeta(1, 5)
+  
+  # mouthpart loss
+  logit_lambda_alpha ~ dLogitBeta(1, 10)
+  for (j in 1:4) {
+    lambda_w[j] ~ dbern(rj)
+    lambda_beta[j] ~ dt(0, sigma = 1, df = 3)
+  } # j
+  for (j in 1:3) {
+    kappa_w[j] ~ dbern(rj)
+    kappa_beta[j] ~ dt(0, sigma = 1, df = 3)
+  } # j
+  
+  # thresholds
+  tau_alpha ~ dnorm(0, 1)
+  tau_beta ~ T(dnorm(0, 1), 0, )
+  tau_sigma ~ dexp(1)
+  for (s in 1:(n_score - 1)) {
+    tau_mu[s] <- tau_alpha + tau_beta * (s - n_score / 2)
+    tau[s] ~ dnorm(tau_mu[s], sd = tau_sigma)
+  } # s
+  
+  # random survey effects (bivariate for psi/mu and lambda/kappa)
+  for (g in 1:2) {
+    # (Cholesky's of) correlation matrices
+    chol_t[g, 1:2, 1:2] ~ dlkj_corr_cholesky(2, 2)
+    cor_t[g] <- (t(chol_t[g, 1:2, 1:2]) %*% chol_t[g, 1:2, 1:2])[1, 2]
+    # SDs
+    sigma_t[g, 1] ~ dexp(1)
+    sigma_t[g, 2] ~ dexp(1)
+    # z-scores
+    for (t in 1:n_survey) {
+      for (j in 1:2) {
+        z_t[g, j, t] ~ dnorm(0, 1)
+      } # j
+      # noncentered bivariate
+      epsilon[g, 1:2, t] <- (z_t[g, 1:2, t]
+                             %*% chol_t[g, 1:2, 1:2]
+                             %*% diag(sigma_t[g, 1:2]))
+
+    } # t
+  } # g
+  
+  # body size
+  size_beta ~ dnorm(0, sd = 0.2)
+  for (t in 1:n_survey) {
+    size_z[t] ~ dnorm(0, 1)
+  } # t
+  size_sigma[1] ~ T(dnorm(0.5, sd = 0.2), 0, )
+  size_sigma[2] ~ dexp(5)
+  
+  for (i in 1:n_ind) {
+    
+    # body size imputation
+    size[i] ~ dnorm(size_beta * site[i] + size_z[survey[i]] * size_sigma[2], sd = size_sigma[1])
+    
+    # functions (GLMs)
+    
+    # expected infection status
+    psi[i] <- expit(logit_psi_alpha
+                    + psi_w[1] * psi_beta[1] * temp[i]
+                    + psi_w[2] * psi_beta[2] * size[i]
+                    + psi_w[3] * psi_beta[3] * site[i]
+                    + psi_w[4] * psi_beta[4] * temp[i] * size[i]
+                    + psi_w[5] * psi_beta[5] * temp[i] * site[i]
+                    + psi_w[6] * psi_beta[6] * size[i] * site[i]
+                    + psi_w[7] * psi_beta[7] * temp[i] * size[i] * site[i]
+                    + epsilon[1, 1, survey[i]]
+                    )
+    
+    # probability of detecting Bd in qPCR
+    delta[i] <- 1 - (1 - r) ^ n[i]
+    
+    # expected infection intensity
+    mu[i] <- (mu_alpha
+              + mu_w[1] * mu_beta[1] * temp[i]
+              + mu_w[2] * mu_beta[2] * size[i]
+              + mu_w[3] * mu_beta[3] * site[i]
+              + mu_w[4] * mu_beta[4] * temp[i] * size[i]
+              + mu_w[5] * mu_beta[5] * temp[i] * site[i]
+              + mu_w[6] * mu_beta[6] * size[i] * site[i]
+              + mu_w[7] * mu_beta[7] * temp[i] * size[i] * site[i]
+              + epsilon[1, 2, survey[i]]
+              )
+    
+    # Expected mouthpart loss status
+    lambda[i] <- expit(logit_lambda_alpha
+                       + lambda_w[1] * lambda_beta[1] * z[i]
+                       + lambda_w[2] * lambda_beta[2] * z[i] * (m[i] - mu_alpha) / (2 * mu_sigma[1])
+                       + lambda_w[3] * lambda_beta[3] * z[i] * size[i]
+                       + lambda_w[4] * lambda_beta[4] * (1 - z[i]) * size[i]
+                       + epsilon[2, 1, survey[i]]
+                       )
+    
+    # expected mouthpart loss intensity (not enough data for kappa_beta[1])
+    kappa_mu[i] <- (kappa_w[1] * kappa_beta[1] * z[i] * (m[i] - mu_alpha) / (2 * mu_sigma[1])
+                    + kappa_w[2] * kappa_beta[2] * z[i] * size[i]
+                    + kappa_w[3] * kappa_beta[3] * (1 - z[i]) * size[i]
+                    + epsilon[2, 2, survey[i]]
+                    )
+    
+    # ordered probit probabilities
+    kappa[1, i] <- pnorm(tau[1], kappa_mu[i])
+    for (s in 2:(n_score - 1)) {
+      kappa[s, i] <- pnorm(tau[s], kappa_mu[i]) - pnorm(tau[s - 1], kappa_mu[i])
+    } # s
+    kappa[n_score, i] <- 1 - pnorm(tau[n_score - 1], kappa_mu[i])
+    
+    # likelihood
+    
+    # infection status (individual)
+    z[i] ~ dbern(psi[i])
+    
+    # infection intensity (individual and sample, centered/noncentered)
+    m[i] ~ dnorm(mu[i], sd = mu_sigma[1])
+    n_z[i] ~ dnorm(0, 1)
+    n[i] <- m[i] + n_z[i] * mu_sigma[2]
+    
+    for (j in 1:n_pcr) {
+      
+      # infection intensity (qPCR)
+      x[i, j] ~ dnorm(n[i], sd = mu_sigma[3])
+      xrep[i, j] ~ dnorm(n[i], sd = mu_sigma[3])
+      
+      # infection status (qPCR)
+      y[i, j] ~ dbern(z[i] * delta[i] + (1 - z[i]) * delta21)
+      yrep[i, j] ~ dbern(z[i] * delta[i] + (1 - z[i]) * delta21)
+      
+    } # j
+    
+    # mouthpart loss status
+    w[i] ~ dbern(lambda[i])
+    wrep[i] ~ dbern(lambda[i])
+    
+    # mouthpart loss intensity
+    v[i] ~ dcat(kappa[1:n_score, i])
+    vrep[i] ~ dcat(kappa[1:n_score, i])
+    
+    # posterior predictive checks (_obs variables indicate observed or not)
+
+    # infection status: sum over replicate qPCR runs, and calculate expected value
+    y_sum[i] <- sum(y[i, 1:n_pcr])
+    yrep_sum[i] <- sum(yrep[i, 1:n_pcr])
+    y_e[i] <- psi[i] * delta[i] * n_pcr
+    
+    for (j in 1:n_pcr) {
+
+      # infection intensity (Chi-square)
+      x_chi[i, j] <- (pow(x[i, j] - mu[i], 2) / mu[i]) * x_obs[i, j]
+      xrep_chi[i, j] <- (pow(xrep[i, j] - mu[i], 2) / mu[i]) * x_obs[i, j]
+      
+    } # j
+  
+    # mouthpart loss intensity (Chi-square)
+    v_e[i] <- sum(kappa[1:n_score, i] * 1:n_score)
+    v_chi[i] <- (pow(v[i] - v_e[i], 2) / v_e[i]) * v_obs[i]
+    vrep_chi[i] <- (pow(vrep[i] - v_e[i], 2) / v_e[i]) * v_obs[i]
+    
+  } # i
+  
+  # bin by survey
+  for (t in 1:n_survey) {
+    
+    # infection status
+    y_survey[t] <- sum(y_sum[survey_first[t]:survey_last[t]])
+    yrep_survey[t] <- sum(yrep_sum[survey_first[t]:survey_last[t]])
+    y_e_survey[t] <- sum(y_e[survey_first[t]:survey_last[t]])
+    
+    # mouthpart loss status
+    w_survey[t] <- sum(w[survey_first[t]:survey_last[t]] * w_obs[survey_first[t]:survey_last[t]])
+    wrep_survey[t] <- sum(wrep[survey_first[t]:survey_last[t]] * w_obs[survey_first[t]:survey_last[t]])
+    w_e_survey[t] <- sum(lambda[survey_first[t]:survey_last[t]] * w_obs[survey_first[t]:survey_last[t]])
+    
+    # Freeman-Tukey
+    y_ft[t] <- pow(sqrt(y_survey[t]) - sqrt(y_e_survey[t]), 2)
+    yrep_ft[t] <- pow(sqrt(yrep_survey[t]) - sqrt(y_e_survey[t]), 2)
+    w_ft[t] <- pow(sqrt(w_survey[t]) - sqrt(w_e_survey[t]), 2)
+    wrep_ft[t] <- pow(sqrt(wrep_survey[t]) - sqrt(w_e_survey[t]), 2)
+    
+  } # t
+  
+  # Bayesian p-values
+  
+  # infection prevalence
+  y_D <- sum(y_ft[1:n_survey])
+  yrep_D <- sum(yrep_ft[1:n_survey])
+  y_bpv <- step(yrep_D - y_D)
+  
+  # infection intensity
+  x_D <- sum(x_chi[1:n_ind,1:n_pcr])
+  xrep_D <- sum(xrep_chi[1:n_ind,1:n_pcr])
+  x_bpv <- step(xrep_D - x_D)
+  
+  # mouthpart loss status
+  w_D <- sum(w_ft[1:n_survey])
+  wrep_D <- sum(wrep_ft[1:n_survey])
+  w_bpv <- step(wrep_D - w_D)
+  
+  # mouthpart loss intensity
+  v_D <- sum(v_chi[1:n_ind])
+  vrep_D <- sum(vrep_chi[1:n_ind])
+  v_bpv <- step(vrep_D - v_D)
+  
+  # further derived quantities
+  
+  # survey-specific quantities
+  for (t in 1:n_survey) {
+    psi_t[t] <- mean(psi[survey_first[t]:survey_last[t]])
+    mu_t[t] <- mean(mu[survey_first[t]:survey_last[t]])
+    lambda_t[t] <- mean(lambda[survey_first[t]:survey_last[t]])
+    kappa_t[t] <- mean(v_ind[survey_first[t]:survey_last[t]])
+  } # t
+  for (i in 1:n_ind) {
+    v_ind[i] <- sum(kappa[1:n_score, i] * 1:n_score)
+  }
+  
+  # mean mouthpart loss score for infected
+  kappa_mean[1] <- pnorm(tau[1])
+  for (s in 2:(n_score - 1)) {
+    kappa_mean[s] <- pnorm(tau[s]) - pnorm(tau[s-1])
+  } # s
+  kappa_mean[n_score] <- 1 - pnorm(tau[n_score - 1])
+  v_mean <- sum(kappa_mean[1:n_score] * 1:n_score)
+
+})
+```
+
+### Data, constants, initial values, monitors
+
+```{r}
+# data
+m2_data <- list(y = y,
+                x = x,
+                w = w,
+                v = v,
+                size = scl(log(tads$mouth)),
+                constraint_int = 1,
+                constraint_tau = rep(1, n_score - 2),
+                constraint_delta = 1) |>
+  glimpse()
+
+# constants
+m2_consts <- list(n_ind = n_ind,
+                  n_pcr = 2,
+                  site = as.numeric(tads$site) - 1.5, # centered
+                  temp = tads$temp_scl,
+                  survey = survey,
+                  n_survey = max(survey),
+                  n_score = n_score,
+                  survey_first = survey_first,
+                  survey_last = survey_last,
+                  mu_alpha_prior = mu_alpha_prior,
+                  # for PPCs: so that NAs don't contribute to the predictions
+                  x_obs = ifelse(is.na(x), 0, 1),
+                  w_obs = ifelse(is.na(tads$jaw_bin), 0, 1),
+                  v_obs = ifelse(tads$jaw == 0 | is.na(tads$jaw), 0, 1)) |>
+  glimpse()
+
+# Initial values
+n_beta <- 7
+m2_inits <- list(z = rep(1, n_ind),
+                 psi_w = rep(1, n_beta), psi_beta = rnorm(n_beta), r = 0.5, delta21 = 0.1,
+                 mu_alpha = mu_alpha_prior, mu_w = rep(1, 7), mu_beta = rnorm(n_beta), n_z = rep(0, n_ind), mu_sigma = rep(0.1, 3),
+                 m = rep(mu_alpha_prior, n_ind), n = rep(mu_alpha_prior, n_ind),
+                 lambda_w = rep(1, 4), lambda_beta = rnorm(4),
+                 kappa_w = rep(1, 3), kappa_beta = rnorm(3), tau_sigma = 0.01,
+                 sigma_t = matrix(0.1, 2, 2)) |>
+  glimpse()
+
+# Parameters
+m2_mons <- c("logit_psi_alpha", "psi_w", "psi_beta", "r", "delta21",
+             "mu_alpha", "mu_w", "mu_beta", "mu_sigma",
+             "logit_lambda_alpha", "lambda_w", "lambda_beta",
+             "kappa_w", "kappa_beta",
+             "tau_alpha", "tau_beta", "tau_sigma", "tau",
+             "sigma_t", "cor_t",
+             "size_beta", "size_z", "size_sigma",
+             "y_D", "yrep_D", "y_bpv",
+             "x_D", "xrep_D", "x_bpv",
+             "w_D", "wrep_D", "w_bpv",
+             "v_D", "vrep_D", "v_bpv",
+             "psi_t", "mu_t", "lambda_t", "kappa_t",
+             "v_mean",
+             "rj")
+```
+
+### Parallel MCMC (not used)
+
+```{r}
+# cluster for parallel processing
+m2_start <- Sys.time()
+cluster <- makeCluster(n_chains)
+
+# function for parallel code
+seed <- set.seed(2023)
+nim_parallel <- function(seed, code, data, consts, inits, mons, mons2, 
+                         n_iter, n_burnin, n_thin, n_thin2) {
+  
+  # load packages
+  library(nimble)
+  library(nimbleNoBounds)
+  library(stringr)
+  
+  # model object
+  Cmodel <- nimbleModel(code, consts, data, check = F, calculate = F) |> compileNimble()
+  conf <- configureMCMC(Cmodel, monitors = mons, monitors2 = mons2)
+  configureRJ(conf,
+              targetNodes = str_c(c("psi", "mu", "lambda", "kappa"), "_beta"),
+              indicatorNodes = str_c(c("psi", "mu", "lambda", "kappa"), "_w"))
+  Cmcmc <- buildMCMC(conf) |> compileNimble(project = Cmodel, resetFunctions = T)
+  
+  # run MCMC
+  fit <- runMCMC(Cmcmc, setSeed = seed, niter = n_iter, nburnin = n_burnin, thin = n_thin, thin2 = n_thin2, inits = inits)
+  return(fit)
+  
+}
+
+# run the function in parallel
+fit <- parLapply(cl = cluster, X = 1:n_chains, fun = nim_parallel,
+                 code = m2_code, data = m2_data, consts = m2_consts, inits = m2_inits, mons = m2_mons, mons2 = c("z", "m"), 
+                 n_iter = n_iter, n_burnin = n_burnin, n_thin = n_thin, n_thin2 = n_thin2)
+stopCluster(cluster)
+m2_end <- Sys.time()
+print(m2_time <- m2_end - m2_start)
+fit[[1]]
+```
+
+### Model and MCMC compilation
+
+```{r}
+# model and mcmc compilation
+model_start <- Sys.time()
+m2_Cmodel <- nimbleModel(m2_code, m2_consts, m2_data, m2_inits, check = F, calculate = F) |>
+  compileNimble()
+m2_conf <- configureMCMC(m2_Cmodel,
+                         monitors = m2_mons,
+                         monitors2 = c("z", "m"))
+configureRJ(m2_conf,
+            targetNodes = str_c(c("psi", "mu", "lambda", "kappa"), "_beta"),
+            indicatorNodes = str_c(c("psi", "mu", "lambda", "kappa"), "_w"))
+m2_conf
+m2_Cmcmc <- buildMCMC(m2_conf) |>
+  compileNimble(project = m2_Cmodel, resetFunctions = T)
+model_end <- Sys.time()
+print(model_time <- model_end - model_start)
+```
+
+### MCMC sampling
+
+```{r}
+mcmc_start <- Sys.time()
+n_thin2 <- 4e1
+m2_fit <- runMCMC(m2_Cmcmc, niter = n_iter, nburnin = n_burnin, thin = n_thin, thin2 = n_thin2, nchains = n_chains, inits = m2_inits)
+mcmc_end <- Sys.time()
+print(mcmc_time <- mcmc_end - mcmc_start)
+```
+
+### Save
+
+```{r}
+# model object
+write_rds(m2_fit, "mcmc/m2-fit.rds")
+
+# MCMC samples
+m2_samples <- do.call(rbind, m2_fit$samples)
+write.csv(m2_samples, "mcmc/m2-samples.csv")
+m2_samples2 <- do.call(rbind, m2_fit$samples2)
+write.csv(m2_samples2, "mcmc/m2_samples2.csv")
+```
+
+# Figures
+
+## Preparation
+
+Set plot theme, read and prepare samples, create prediction ranges, and summarise latent *Bd* infection status and intensities.
+
+```{r}
+# theme
+theme_set(theme_classic(base_size = 10))
+theme_update(axis.ticks = element_line(color = "#333333", linewidth = 0.3),
+             axis.line = element_line(color = NA),
+             axis.title = element_text(color = "#333333"),
+             axis.text = element_markdown(color = "#333333"),
+             panel.border = element_rect(color = "#333333", fill = NA, linewidth = 0.6),
+             legend.title = element_text(color = "#333333"),
+             legend.text = element_text(color = "#333333"),
+             legend.position = "none",
+             strip.text = element_text(size = rel(1)),
+             strip.background = element_rect(color = NA))
+
+# read samples from body length model
+m1_fit <- read_rds("mcmc/m1-fit.rds")
+m1 <- do.call(rbind, m1_fit) |> as_tibble() |> clean_names()
+m1_n <- nrow(m1)
+
+# read samples from infections and mouthpart loss model
+m2_fit <- read_rds("mcmc/m2-fit.rds")
+m2 <- do.call(rbind, m2_fit$samples) |> as_tibble() |> clean_names()
+m2_n <- nrow(m2)
+m2_2 <- do.call(rbind, m2_fit$samples2) |> as_tibble() |> clean_names()
+m2_n2 <- nrow(m2_2)
+
+# number of values in prediction ranges
+n_pred <- 100
+
+# temperature range
+temp_pred <- seq(8, 21, length.out = n_pred)
+temp_pred_scl <- (temp_pred - mean(tads$temp_air)) / (2 * sd(tads$temp_air))
+
+# Bd infection intensity range
+m_pred <- seq(2, 6, length.out = n_pred)
+
+# mouthpart width (pixels) range
+size_pred_scl <- seq(-2, 2, length.out = n_pred)
+
+# body length (calipers) range)
+body_pred <- seq(0, 25, length.out = n_pred)
+
+# convert size to body length mm
+size_pred <- 
+  # backtransform the standardised range to pixels
+  ((size_pred_scl * (2 * sd(log(tads$mouth), na.rm = T)) + mean(log(tads$mouth), na.rm = T) -
+      # subtract the intercept and divide by the slope
+      median(m1$beta_1)) / median(m1$beta_2)) |>
+  # exponentiate to get to original scale
+  exp()
+
+# also add columns of converted pixel lengths to mm
+tads <- tads |>
+  mutate(length_pred = ((log(mouth) - median(m1$beta_1)) / median(m1$beta_2)) |>
+           exp())
+
+# summarise latent infection status (not used)
+z <- m2_2 |>
+  summarise(across(starts_with("z"), .fns = median)) |>
+  pivot_longer(cols = everything(), names_to = NULL, values_to = "z")
+
+# latent infection intensity
+m <- m2_2 |>
+  summarise(across(starts_with("m_"), .fns = median)) |>
+  pivot_longer(everything(), names_to = NULL, values_to = "m_est") |>
+  mutate(m_obs = if_else(tads$load > 0, log10(tads$load), NA),
+         length = tads$length_pred)
+```
+
+## Violin plots of lengths
+
+Observed tadpole lengths (many more than the <=40 sampled for *Bd*) during each survey at Brindle Creek.
+
+```{r}
+# Plot
+lengths2 |>
+  mutate(date = factor(date)) |>
+  filter(length > 5,
+         site == "brindle") |>
+  ggplot(aes(x = length, y = fct_rev(date))) +
+  geom_sina(shape = 16,
+            color = "#295384",
+            size = 1,
+            alpha = 1/4) +
+  labs(x = "Body length (mm)",
+       y = "Survey") +
+  scale_x_continuous(breaks = seq(10, 20, 5),
+                     limits = c(5, 22.5),
+                     expand = c(0, 0)) +
+  theme(axis.line = element_line(color = "#333333", linewidth = 0.3),
+        panel.border = element_blank())
+ggsave("figs/fig-lengths-brindle.png", width = 4, height = 3, units = "in", dpi = 300)
+```
+
+## *Bd* infection status
+
+Plots observations and predictions of infection status as a function of temperature and body size.
+
+```{r}
+# Bd infection status as a function of temperature
+psi_fig_temp <-
+  # generate predictions
+sapply(temp_pred_scl, \(temp) expit(m2$logit_psi_alpha + m2$psi_beta_1 * temp)) |>
+  # transpose and convert to tibble
+  t() |>
+  as_tibble() |>
+  # add input temperatures
+  mutate(temp = temp_pred) |>
+  # long format
+  pivot_longer(-temp, values_to = "psi") |>
+  # plot
+  ggplot(aes(x = temp, y = psi)) +
+  # observed data
+  stat_dots(data = tads,
+            aes(x = temp_air + rnorm(n_ind, 0, 0.15), 
+                y = infected, 
+                side = ifelse(infected == 0, "top", "bottom"),
+                color = infected == 1,
+                fill = infected == 1),
+            scale = 1/2) +
+  # prediction
+  stat_lineribbon(color = "#333333",
+                  fill = "#333333",
+                  .width = 0.95,
+                  size = 1/2,
+                  point_interval = median_hdci,
+                  alpha = 1/2) +
+  stat_lineribbon(color = "#333333",
+                  fill = NA,
+                  .width = 0.95,
+                  size = 1/2,
+                  point_interval = median_hdci,
+                  alpha = 4/5) +
+  # scales
+  scale_colour_manual(values = c("#5d6174", "#b64f32")) +
+  scale_fill_manual(values = c(NA, "#5d6174", "#b64f32")) +
+  scale_x_continuous(breaks = seq(10, 20, 2),
+                     expand = c(0, 0),
+                     limits = c(9, 21)) +
+  scale_y_continuous(breaks = seq(0.2, 1, 0.2),
+                     expand = c(0, 0),
+                     limits = c(0, 1.0025)) +
+  labs(x = "Temperature (ºC)",
+       y = expression(paste(italic("Bd")," infection status")))
+
+# Bd infection status as a function of body size
+psi_fig_size <-
+  sapply(size_pred_scl, \(size) expit(m2$logit_psi_alpha + m2$psi_beta_2 * size)) |>
+  t() |>
+  as_tibble() |>
+  mutate(size = size_pred) |>
+  pivot_longer(-size, values_to = "psi") |>
+  ggplot(aes(x = size, y = psi)) +
+  stat_dots(data = tads,
+            aes(x = length_pred, 
+                y = infected,
+                side = ifelse(infected == 0, "top", "bottom"),
+                color = infected == 1,
+                fill = infected == 1),
+            scale = 1/2) +
+  stat_lineribbon(color = "#333333",
+                  fill = "#333333",
+                  .width = 0.95,
+                  size = 1/2,
+                  point_interval = median_hdci,
+                  alpha = 1/2) +
+  stat_lineribbon(color = "#333333",
+                  fill = NA,
+                  .width = 0.95,
+                  size = 1/2,
+                  point_interval = median_hdci,
+                  alpha = 4/5) +
+  scale_color_manual(values = c("#5d6174", "#b64f32")) +
+  scale_fill_manual(values = c(NA, "#5d6174", "#b64f32")) +
+  scale_x_continuous(breaks = seq(5, 35, 5),
+                     expand = c(0, -1),
+                     limits = c(1.5, 38.5)) +
+  scale_y_continuous(breaks = seq(0.2, 1, 0.2),
+                     expand = c(0, 0),
+                     limits = c(0, 1.002)) +
+  labs(x = "Body size (mm)",
+       y = expression(paste(italic("Bd")," infection status")))
+
+# assemble and save
+psi_fig <- (psi_fig_temp | psi_fig_size) +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") &
+  theme(plot.tag = element_text(face = "bold", color = "#333333"))
+ggsave("figs/fig-psi.png", psi_fig, width = 6.5, height = 3, units = "in", dpi = 300)
+```
+
+## *Bd* infection intensity
+
+Plot predictions of infection intensity as a function of (log) body size/mouthpart width alongside naive observed infection intensities and latent infection intensities estimated by the model.
+
+```{r}
+# Bd infection intensity as a function of body size
+mu_fig <- 
+  sapply(size_pred_scl, \(size) rnorm(m2_n, m2$mu_alpha + m2$mu_beta_2 * size, m2$mu_sigma_1)) |>
+  t() |>
+  as_tibble() |>
+  mutate(size = size_pred) |>
+  pivot_longer(-size, values_to = "mu") |>
+  ggplot(aes(x = size, y = mu)) +
+  # segments to connect observed (naive) and estimated infection intensity
+  geom_segment(data = m |> drop_na(m_obs),
+               aes(x = length, xend = length, y = m_obs, yend = m_est),
+               linewidth = 1/10,
+               alpha = 1/2) +
+  # observed and estimated intensity
+  geom_point(data = m |>
+               drop_na(m_obs) |>
+               pivot_longer(contains("m"), values_to = "mu") |>
+               mutate(size = length),
+             aes(color = factor(name)),
+             shape = 16,
+             size = 1,
+             alpha = 2/3) * (blend("lighten") + blend("multiply", alpha = 1/2)) +
+  # prediction
+  stat_lineribbon(color = "#333333",
+                  fill = "#333333",
+                  .width = 0.95,
+                  size = 1/2,
+                  point_interval = median_qi,
+                  alpha = 1/2) +
+  stat_lineribbon(color = "#333333",
+                  fill = NA,
+                  .width = 0.95,
+                  size = 1/2,
+                  point_interval = median_qi,
+                  alpha = 4/5) +
+  scale_color_manual(values = c("#a93636", "#419296")) +
+  scale_x_continuous(breaks = seq(10, 35, 5),
+                     expand = c(0, -3),
+                     limits = c(2, 40.5)) +
+  scale_y_continuous(breaks = seq(1, 7, 1)) +
+  theme(axis.line = element_line(color = "#333333", linewidth = 0.3),
+        panel.border = element_rect(color = NA)) +
+  labs(x = "Body size (mm)",
+       y = expression(paste(italic("Bd")," infection intensity")),
+       color = NULL)
+
+# save
+ggsave("figs/fig-mu.png", mu_fig, width = 3.5, height = 3, units = "in", dpi = 600, device = png, type = "cairo")
+```
+
+## Mouthpart loss
+
+Mouthpart loss status as (a) a function of *Bd* infection status and (b) *Bd* infection intensity, and (c) mouthpart loss intensity as a function of *Bd* infection status.
+
+```{r}
+# mouthpart loss as a function of infection status
+lambda_fig_psi <- 
+  tads |>
+  ggplot(aes(if_else(infected == 1, 2, infected))) +
+  # data
+  geom_jitter(aes(y = if_else(jaw_bin == 0, 0.05, 0.95),
+                  color = jaw_bin == 0),
+              height = 1/20,
+              shape = 16,
+              size = 1,
+              alpha = 1/2) +
+  # uninfected
+  stat_halfeye(aes(x = 0, y = lambda),
+               data = tibble(lambda = expit(m2$logit_lambda_alpha)),
+               point_interval = "median_hdci",
+               .width = 0.95,
+               color = "#333333",
+               fill = "#333333",
+               size = 1/10,
+               shape = 16,
+               slab_alpha = 1/2) +
+  # infected
+  stat_halfeye(aes(x = 2, y = lambda),
+               data = tibble(lambda = expit(m2$logit_lambda_alpha + m2$lambda_beta_1)),
+               point_interval = "median_hdci",
+               .width = 0.95,
+               color = "#333333",
+               fill = "#333333",
+               size = 1/10,
+               shape = 16,
+               slab_alpha = 1/2) +
+  scale_color_manual(values = c("#f05b43", "#748f46")) +
+  scale_x_continuous(breaks = c(0, 2),
+                     labels = c(expression(paste(italic("Bd"), "–")), 
+                                expression(paste(italic("Bd"), "+"))),
+                     limits = c(-1, 3)) +
+  scale_y_continuous(breaks = seq(0.2, 1, 0.2),
+                     expand = c(0, 0),
+                     limits = c(0, 1.002)) +
+  labs(x = expression(paste(italic("Bd")," infection status")),
+       y = "Mouthpart loss status")
+
+# mouthpart loss as a function of infection status
+lambda_fig_mu <-
+  sapply(m_pred, \(x) expit(m2$logit_lambda_alpha
+                            + m2$lambda_beta_1
+                            + m2$lambda_beta_2 * (x - m2$mu_alpha) / (2 * m2$mu_sigma_2))) |>
+  t() |>
+  as_tibble() |>
+  mutate(m = m_pred) |>
+  pivot_longer(-m, values_to = "lambda") |>
+  ggplot(aes(x = m, y = lambda)) +
+  stat_dots(data = tads |> mutate(m = if_else(infected == 1, m$m_est, NA)),
+            aes(y = jaw_bin, 
+                side = if_else(jaw_bin == 0, "top", "bottom"), 
+                color = jaw_bin == 1,
+                fill = jaw_bin == 1),
+            scale = 4/5,
+            na.rm = T) +
+  stat_lineribbon(color = "#333333",
+                  fill = "#333333",
+                  .width = 0.95,
+                  size = 1/2,
+                  point_interval = median_hdci,
+                  alpha = 1/2) +
+  stat_lineribbon(color = "#333333",
+                  fill = NA,
+                  .width = 0.95,
+                  size = 1/2,
+                  point_interval = median_hdci,
+                  alpha = 4/5) +
+  scale_color_manual(values = c("#748f46", "#f05b43")) +
+  scale_fill_manual(values = c(NA, "#748f46", "#f05b43")) +
+  scale_x_continuous(breaks = seq(2, 6, 1),
+                     expand = c(0, -0.05),
+                     limits = c(2.5, 5.5)) +
+  scale_y_continuous(breaks = seq(0.2, 1, 0.2),
+                     expand = c(0, 0),
+                     limits = c(0, 1.002)) +
+  labs(x = expression(paste(italic("Bd")," infection intensity")),
+       y = "Mouthpart loss status")
+
+# mouthpart loss intensity for uninfected and infected (no posterior for uninfected)
+kappa_fig <-
+  tads |>
+  filter(jaw > 0) |>
+  ggplot(aes(infected * 2, jaw)) +
+  geom_jitter(height = 1/10,
+              shape = 16,
+              color = "#f05b43",
+              size = 1,
+              alpha = 1/2) +
+  # infected
+  stat_halfeye(aes(x = 2, y = est),
+               data = tibble(est = m2$v_mean),
+               point_interval = "median_hdci",
+               .width = 0.95,
+               color = "#333333",
+               fill = "#333333",
+               size = 1/10,
+               shape = 16,
+               slab_alpha = 1/2) +
+  scale_x_continuous(breaks = c(0, 1) * 2,
+                     labels = c(expression(paste(italic("Bd"), "–")), 
+                                expression(paste(italic("Bd"), "+"))),
+                     limits = c(-1, 3)) +
+  scale_y_continuous(breaks = seq(1, 10, 1),
+                     expand = c(0, 0),
+                     limits = c(0, 10.5)) +
+  labs(x = expression(paste(italic("Bd")," infection status")),
+       y = "Mouthpart loss intensity")
+
+# assemble and save
+kaplam_fig <- 
+  (lambda_fig_psi | lambda_fig_mu | kappa_fig) +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") &
+  theme(plot.tag = element_text(face = "bold", color = "#333333"))
+ggsave("figs/fig-kaplam.png", kaplam_fig, width = 9, height = 3, units = "in", dpi = 600)
+```
+
+## Posterior predictive checks
+
+```{r}
+# Bd infection status
+ppc_Y <-
+  tibble(data = m2$y_d,
+         rep = m2$yrep_d) |>
+  ggplot(aes(data, rep, color = data - rep < 0)) +
+  geom_abline(linewidth = 0.2) +
+  geom_point(shape = 16,
+             size = 1,
+             alpha = 1/10) +
+  scale_color_manual(values = c("#333333", "#a93636")) +
+  scale_x_continuous(breaks = seq(5, 15, 5),
+                     expand = c(0, 0),
+                     limits = c(0, 17.5)) +
+  scale_y_continuous(breaks = seq(5, 15, 5),
+                     expand = c(0, 0),
+                     limits = c(0, 17.5)) +
+  annotate("text",
+           x = 0.1 * 17.5,
+           y = 0.9 * 17.5,
+           hjust = 0,
+           label = paste0("BPV = ", round(mean(m2$y_bpv), 2)), 
+           size = 2.5) +
+  labs(x = TeX(r"($\it{D_y}$)"),
+       y = TeX(r"($\it{D}^{rep}_{\it{y}}$)")) +
+  coord_fixed()
+
+# Bd infection intensity
+ppc_X <-
+  tibble(data = m2$x_d,
+         rep = m2$xrep_d) |>
+  ggplot(aes(data, rep, color = data - rep < 0)) +
+  geom_abline(linewidth = 0.2) +
+  geom_point(shape = 16,
+             size = 1,
+             alpha = 1/10) +
+  scale_color_manual(values = c("#333333", "#a93636")) +
+  scale_x_continuous(breaks = seq(120, 180, 30),
+                     expand = c(0, 0),
+                     limits = c(105, 195)) +
+  scale_y_continuous(breaks = seq(120, 180, 30),
+                     expand = c(0, 0),
+                     limits = c(105, 195)) +
+  annotate("text",
+           x = 105 + 0.1 * (195 - 105),
+           y = 105 + 0.9 * (195 - 105),
+           hjust = 0,
+           label = paste0("BPV = ", round(mean(m2$x_bpv), 2)),
+           size = 2.5) +
+  labs(x = TeX(r"($\it{D_x}$)"),
+       y = TeX(r"($\it{D}^{rep}_{\it{x}}$)")) +
+  coord_fixed()
+
+# mouthpart loss status
+ppc_W <-
+  tibble(data = m2$w_d,
+         rep = m2$wrep_d) |>
+  ggplot(aes(data, rep, color = data - rep < 0)) +
+  geom_abline(linewidth = 0.2) +
+  geom_point(shape = 16,
+             size = 1,
+             alpha = 1/10) +
+  scale_color_manual(values = c("#333333", "#a93636")) +
+  scale_x_continuous(breaks = seq(2, 6, 2),
+                     expand = c(0, 0),
+                     limits = c(0, 7)) +
+  scale_y_continuous(breaks = seq(2, 6, 2),
+                     expand = c(0, 0),
+                     limits = c(0, 7)) +
+  annotate("text",
+           x = 0.1 * 7,
+           y = 0.9 * 7,
+           hjust = 0,
+           label = paste0("BPV = ", round(mean(m2$w_bpv), 2)), 
+           size = 2.5,
+           ) +
+  labs(x = TeX(r"($\it{D_w}$)"),
+       y = TeX(r"($\it{D}^{rep}_{\it{w}}$)")) +
+  coord_fixed()
+
+# mouthpart loss intensity
+ppc_V <-
+  tibble(data = m2$v_d,
+         rep = m2$vrep_d) |>
+  ggplot(aes(data, rep, color = data - rep < 0)) +
+  geom_abline(linewidth = 0.2) +
+  geom_point(shape = 16,
+             size = 1,
+             alpha = 1/10) +
+  scale_color_manual(values = c("#333333", "#a93636")) +
+  scale_x_continuous(breaks = seq(120, 240, 60),
+                     expand = c(0, 0),
+                     limits = c(90, 270)) +
+  scale_y_continuous(breaks = seq(120, 240, 60),
+                     expand = c(0, 0),
+                     limits = c(90, 270)) +
+  annotate("text",
+           x = 90 + 0.1 * (270 - 90),
+           y = 90 + 0.9 * (270 - 90),
+           hjust = 0,
+           label = paste0("BPV = ", round(mean(m2$v_bpv), 2)), 
+           size = 2.5) +
+  labs(x = TeX(r"($\it{D_v}$)"),
+       y = TeX(r"($\it{D}^{rep}_{\it{v}}$)")) +
+  coord_fixed()
+
+# assemble and save
+ppc_fig <- 
+  (ppc_Y | ppc_X) / (ppc_W | ppc_V) +
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") &
+  theme(plot.tag = element_text(face = "bold", color = "#333333"),
+        axis.line = element_line(color = "#333333", linewidth = 0.3),
+        panel.border = element_blank())
+ggsave("figs/fig-ppc.png", ppc_fig, width = 5, height = 5, units = "in", dpi = 300)
+```
+
+## Pixel length vs. body length
+
+```{r}
+# get posterior medians of parameters
+apply(m1, 2, median)
+
+# loglog regression of mouthpart width (pixels) and body length (mm)
+fig_lengths <- sapply(body_pred, \(body) exp(m1$beta_1 + m1$beta_2 * log(body))) |>
+  t() |>
+  as_tibble() |>
+  mutate(body = body_pred) |>
+  pivot_longer(-body, values_to = "mouth") |>
+  slice_sample(n = 200) |>
+  ggplot(aes(body, mouth)) +
+  geom_point(aes(length, mouth),
+             data = lengths,
+             shape = 16,
+             color = "#295384",
+             size = 1,
+             alpha = 1/2) +
+  stat_lineribbon(color = "#333333",
+                  fill = "#333333",
+                  .width = 0.95,
+                  size = 1/2,
+                  point_interval = median_hdci,
+                  alpha = 1/2) +
+  stat_lineribbon(color = "#333333",
+                  fill = NA,
+                  .width = 0.95,
+                  size = 1/2,
+                  point_interval = median_hdci,
+                  alpha = 4/5) +
+  # log(y) = beta0 + beta1 * log(x) + epsilon, epsilon ~ N(0, sigma^2) => 
+  # y = exp(beta0) * x ^ beta1 * epsilon, epsilon ~ Log-N(0, sigma^2)
+  annotate("text",
+           label = TeX(r'($\it{y_i} = 112 \it{x_i}^{0.62} \epsilon_i$)'),
+           x = 5 + 0.1 * (22.5-5),
+           y = 250 + 0.9 * (850-250),
+           hjust = 0,
+           vjust = 0,
+           size = 2.5) +
+  annotate("text",
+           label = TeX(r'($\epsilon_i \sim Lognormal(0, 0.094^2)$)'),
+           x = 5.2 + 0.1 * (22.5-5),
+           y = 250 + 0.82 * (850-250),
+           hjust = 0,
+           vjust = 0,
+           size = 2.5) +
+  scale_x_continuous(breaks = seq(10, 20, 5),
+                     limits = c(5, 22.5),
+                     expand = c(0, 0)) +
+  scale_y_continuous(breaks = seq(300, 800, 100),
+                     limits = c(250, 850),
+                     expand = c(0, 0)) +
+  labs(x = "Body length (mm)",
+       y = "Mouthpart width (px)") +
+  theme(axis.line = element_line(color = "#333333", linewidth = 0.3),
+        panel.border = element_rect(color = NA))
+ggsave("figs/fig-lengths.png", fig_lengths, width = 3.5, height = 3, units = "in", dpi = 300)
+```
+
+## Survey-specific marginal estimates
+
+```{r}
+# theme update and site colours
+theme_update(legend.position = "right")
+
+# add note of whether mouthpart loss was recorded in a survey
+tads <- tads |>
+  add_count(date) |>
+  mutate(n_na = length(which(is.na(jaw_bin))), 
+         all_na = if_else(n_na == n, 1, 0),
+         .by = date)
+  
+# survey dates associated sites, and whether mouthpart loss was recorded
+surv_dates <- tads |>
+  select(site, date, all_na) |>
+  arrange(date) |>
+  distinct(date, .keep_all = T)
+
+# prepare draws and colours
+surv_est <- m2 |>
+  select(contains(str_c(c("psi", "mu", "lambda", "kappa"), "_t"))) |>
+  pivot_longer(everything(), values_to = "iteration") |> 
+  mutate(parameter = rep(c("psi", "mu", "lambda", "kappa"), each = n_survey) |>
+           rep(n() / 4 / n_survey) |>
+           factor(levels = c("psi", "mu", "lambda", "kappa")),
+         Survey = rep(surv_dates$date, n() / n_survey),
+         Site = rep(surv_dates$site, n() / n_survey) |>
+           factor(levels = c("brindle", "tuntable"), labels = c("Brindle", "Tuntable")),
+         all_na = rep(surv_dates$all_na, n() / n_survey))
+surv_cols <- c("#663171", "#0c7156")
+
+# psi
+surv_psi <- surv_est |>
+  filter(parameter == "psi") |>
+  ggplot(aes(Survey, iteration, colour = Site)) +
+  stat_pointinterval(point_interval = "median_hdci",
+                     .width = 0.95,
+                     interval_size_range = c(1/4, 1/2),
+                     shape = 16) +
+  scale_colour_manual(values = surv_cols) +
+  scale_x_date(date_labels = "%b %Y") +
+  scale_y_continuous(breaks = seq(0.2, 1, 0.2),
+                     expand = c(0, 0),
+                     limits = c(0, 1.0025)) +
+  labs(y = expression(paste(italic("Bd")," infection prevalence")))
+
+# mu
+surv_mu <- surv_est |>
+  filter(parameter == "mu") |>
+  ggplot(aes(Survey, iteration, colour = Site)) +
+  stat_pointinterval(point_interval = "median_hdci",
+                     .width = 0.95,
+                     interval_size_range = c(1/4, 1/2),
+                     shape = 16) +
+  scale_colour_manual(values = surv_cols) +
+  scale_x_date(date_labels = "%b %Y") +
+  scale_y_continuous(breaks = seq(3, 5, 1),
+                     expand = c(0, 0),
+                     limits = c(2.75, 5.25)) +
+  labs(y = expression(paste(italic("Bd")," infection intensity")))
+
+# lambda
+surv_lambda <- surv_est |>
+  filter(parameter == "lambda",
+         all_na == 0) |>
+  ggplot(aes(Survey, iteration, colour = Site)) +
+  stat_pointinterval(point_interval = "median_hdci",
+                     .width = 0.95,
+                     interval_size_range = c(1/4, 1/2),
+                     shape = 16) +
+  scale_colour_manual(values = surv_cols) +
+  scale_x_date(date_labels = "%b %Y") +
+  scale_y_continuous(breaks = seq(0.2, 1, 0.2),
+                     expand = c(0, 0),
+                     limits = c(0, 1.0025)) +
+  labs(x = "Survey",
+       y = "Mouthpart loss prevalence")
+
+# kappa
+surv_kappa <- surv_est |>
+  filter(parameter == "kappa",
+         all_na == 0) |>
+  ggplot(aes(Survey, iteration, colour = Site)) +
+  stat_pointinterval(point_interval = "median_hdci",
+                     .width = 0.95,
+                     interval_size_range = c(1/4, 1/2),
+                     shape = 16) +
+  scale_colour_manual(values = surv_cols) +
+  scale_x_date(date_labels = "%b %Y") +
+  labs(y = "Mouthpart loss intensity")
+
+# assemble and save
+surv_fig <- ((surv_psi | surv_mu) / (surv_lambda | surv_kappa)) +
+  plot_layout(guides = "collect") &
+  plot_annotation(tag_levels = "a", tag_prefix = "(", tag_suffix = ")") &
+  theme(plot.tag = element_text(face = "bold", color = "#333333"),
+        legend.position = "bottom")
+ggsave("figs/fig-surv.png", surv_fig, width = 6.5, height = 6.5, units = "in", dpi = 300)
+```
+
